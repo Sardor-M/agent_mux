@@ -1,28 +1,82 @@
 -- agent_loop.lua  —  the multi-turn LLM ↔ tool loop.
 --
--- v0.1 (week 1) implements only the **turn-only** path: call upstream,
--- stream deltas to the client, persist the assistant turn, exit on any
--- non-`tool_use` stop_reason. When the model emits `tool_use`, we emit a
--- typed informational event and stop — tool dispatch is week 2.
+-- Week 2: tool dispatch is wired in. When the model emits `tool_use`, we
+-- run all the requested tools concurrently via tools.dispatcher, append
+-- their results as the next user turn, and continue. Other stop_reasons
+-- terminate as before.
 --
--- The loop is the project's conceptual core. See docs/IMPLEMENTATION_PLAN.md §7.
--- Week 2 will plug `tools.dispatcher` into the `tool_use` branch; week 3 adds
--- per-tool rate-limit, hooks, cancellation. Keep the surface stable.
+-- A defensive `max_turns` guard keeps a misbehaving model from looping
+-- forever; budget enforcement (token / wall-clock caps) lands in week 3
+-- and replaces this guard.
 
-local upstream  = require("agent_mux.upstream.anthropic")
-local store     = require("agent_mux.session.store")
-local metrics   = require("agent_mux.observability.metrics")
-local log       = require("agent_mux.observability.log")
-local errors    = require("agent_mux.errors")
+local upstream   = require("agent_mux.upstream.anthropic")
+local store      = require("agent_mux.session.store")
+local registry   = require("agent_mux.tools.registry")
+local dispatcher = require("agent_mux.tools.dispatcher")
+local metrics    = require("agent_mux.observability.metrics")
+local log        = require("agent_mux.observability.log")
+local errors     = require("agent_mux.errors")
 
 local _M = {}
 _M.__index = _M
+
+-- Defensive cap. Real budgets land in week 3.
+local MAX_TURNS = 16
 
 function _M.new(session)
     return setmetatable({ session = session, _turns = 0 }, _M)
 end
 
--- Run the loop. `sse` is a transport/sse.lua writer.
+-- One iteration: call upstream, stream chunks, persist turn, return the
+-- aggregated response so the caller can branch on stop_reason.
+local function call_one_turn(self, sse, turn_n)
+    local started_ms = ngx.now() * 1000
+
+    sse:emit("turn_start", { turn = turn_n })
+
+    local response, err = upstream.call(
+        self.session.model,
+        self.session.messages,
+        -- Advertise our registered tools to the model. Empty array is
+        -- fine; the upstream client elides it from the request.
+        registry.to_api_schema(),
+        {
+            on_chunk = function(piece)
+                sse:emit("model_chunk", { turn = turn_n, text = piece })
+            end,
+        }
+    )
+
+    if not response then
+        return nil, err
+    end
+
+    self.session:append_assistant(response)
+    local ok, ferr = store.flush(self.session)
+    if not ok then
+        log.warn("session_flush_failed", { session_id = self.session.id, err = ferr })
+    end
+
+    sse:emit("turn_complete", {
+        turn        = turn_n,
+        stop_reason = response.stop_reason,
+        usage       = response.usage,
+        latency_ms  = ngx.now() * 1000 - started_ms,
+    })
+    metrics.inc("agent_mux_turns_total", {
+        model = self.session.model, stop_reason = response.stop_reason or "unknown",
+    })
+    if response.usage then
+        metrics.inc("agent_mux_tokens_total",
+            { direction = "input",  model = self.session.model },
+            response.usage.input_tokens or 0)
+        metrics.inc("agent_mux_tokens_total",
+            { direction = "output", model = self.session.model },
+            response.usage.output_tokens or 0)
+    end
+    return response
+end
+
 function _M:run(sse)
     sse:emit("session_start", { session_id = self.session.id, model = self.session.model })
     metrics.inc("agent_mux_sessions_total", { status = "running" })
@@ -30,56 +84,29 @@ function _M:run(sse)
     while true do
         self._turns = self._turns + 1
         local turn_n = self._turns
-        local started_ms = ngx.now() * 1000
 
-        sse:emit("turn_start", { turn = turn_n })
+        if turn_n > MAX_TURNS then
+            log.warn("max_turns_exceeded", { session_id = self.session.id, max = MAX_TURNS })
+            sse:emit("done", {
+                stop_reason = "max_turns",
+                turns       = turn_n - 1,
+                note        = ("loop guard at %d turns"):format(MAX_TURNS),
+            })
+            store.complete(self.session, "max_turns")
+            return
+        end
 
-        local response, err = upstream.call(
-            self.session.model,
-            self.session.messages,
-            self.session.tools,
-            {
-                on_chunk = function(piece)
-                    sse:emit("model_chunk", { turn = turn_n, text = piece })
-                end,
-            }
-        )
-
+        local response, err = call_one_turn(self, sse, turn_n)
         if not response then
             log.error("upstream_failed", { session_id = self.session.id, err = err })
             sse:emit("error", errors.to_sse_payload({
-                code    = "upstream_failed",
-                message = err,
+                code = "upstream_failed", message = err,
             }))
             store.error(self.session, err)
             metrics.inc("agent_mux_turns_total", {
                 model = self.session.model, stop_reason = "error",
             })
             return
-        end
-
-        self.session:append_assistant(response)
-        local ok, ferr = store.flush(self.session)
-        if not ok then
-            log.warn("session_flush_failed", { session_id = self.session.id, err = ferr })
-        end
-
-        sse:emit("turn_complete", {
-            turn        = turn_n,
-            stop_reason = response.stop_reason,
-            usage       = response.usage,
-            latency_ms  = ngx.now() * 1000 - started_ms,
-        })
-        metrics.inc("agent_mux_turns_total", {
-            model = self.session.model, stop_reason = response.stop_reason or "unknown",
-        })
-        if response.usage then
-            metrics.inc("agent_mux_tokens_total",
-                { direction = "input",  model = self.session.model },
-                response.usage.input_tokens or 0)
-            metrics.inc("agent_mux_tokens_total",
-                { direction = "output", model = self.session.model },
-                response.usage.output_tokens or 0)
         end
 
         local stop = response.stop_reason
@@ -91,25 +118,35 @@ function _M:run(sse)
         end
 
         if stop == "tool_use" then
-            -- Week 2 will dispatch here; for now, surface what we'd run and stop.
             local pending = upstream.tool_uses(response)
-            sse:emit("done", {
-                stop_reason   = "tool_use",
-                turns         = turn_n,
-                pending_tools = pending,
-                note          = "tool dispatch arrives in week 2 — see docs/IMPLEMENTATION_PLAN.md §8",
-            })
-            store.complete(self.session, "tool_use_pending")
+            if #pending == 0 then
+                -- Defensive: stop_reason said tool_use but no blocks. Treat
+                -- as terminal so we don't spin.
+                sse:emit("done", {
+                    stop_reason = "tool_use",
+                    turns       = turn_n,
+                    note        = "stop_reason=tool_use but no tool_use blocks present",
+                })
+                store.complete(self.session, "tool_use_empty")
+                return
+            end
+
+            local results = dispatcher.run_concurrent(self.session, pending, sse)
+            self.session:append_user_with_tool_results(results)
+            local fok, ferr = store.flush(self.session)
+            if not fok then
+                log.warn("session_flush_failed", { session_id = self.session.id, err = ferr })
+            end
+            -- Continue the loop — next iteration sends the tool_results
+            -- back upstream and the model produces its next turn.
+        else
+            log.warn("unknown_stop_reason", { stop_reason = stop, session_id = self.session.id })
+            sse:emit("done", { stop_reason = stop or "unknown", turns = turn_n })
+            store.complete(self.session, stop or "unknown")
             return
         end
-
-        -- Defensive: an unknown stop_reason shouldn't loop forever. Treat
-        -- as terminal so a bug in upstream parsing can't run away.
-        log.warn("unknown_stop_reason", { stop_reason = stop, session_id = self.session.id })
-        sse:emit("done", { stop_reason = stop or "unknown", turns = turn_n })
-        store.complete(self.session, stop or "unknown")
-        return
     end
 end
 
+_M.MAX_TURNS = MAX_TURNS
 return _M
