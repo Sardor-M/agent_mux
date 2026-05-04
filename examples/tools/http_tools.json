@@ -1,0 +1,21 @@
+{
+  "tools": [
+    {
+      "name": "search",
+      "description": "Search a small knowledge base for short factual answers. Provide a single 'query' string.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "What to look up. Single sentence preferred."
+          }
+        },
+        "required": ["query"]
+      },
+      "url": "http://127.0.0.1:8080/mock/tools/search",
+      "method": "POST",
+      "timeout_ms": 3000
+    }
+  ]
+}
