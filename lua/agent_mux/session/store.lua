@@ -1,31 +1,190 @@
 -- session/store.lua  —  Redis-backed session CRUD.
 --
--- Stub for v0.1 scaffolding. Real implementation lands in week 1.
--- Schema and operations are documented in docs/IMPLEMENTATION_PLAN.md §9.
+-- Schema (one Redis key per session, JSON-encoded):
 --
--- Public surface (planned):
---   create(req)           → session
---   load(session_id)      → session | nil, err
---   flush(session)        → ok | nil, err     (debounced write-back)
---   complete(session)     → ok                 (terminal state, longer TTL)
---   resume(session_id)    → session | nil, err
+--   session:<session_id>  →  {
+--     id, schema_version, model, agent_id, org_id,
+--     messages,           ← Anthropic-shaped array
+--     tools,              ← schemas pass-through (week 2 will use)
+--     tool_policy,
+--     usage,              ← { input_tokens, output_tokens }
+--     budget,             ← { max_tokens, wall_clock_ms }
+--     status,             ← "running" | "completed" | "cancelled" | "errored"
+--     created_at, updated_at,
+--     stop_reason         ← present when status != "running"
+--   }
+--
+-- TTL: while running, 1h (so a wedged session can't pin memory forever).
+-- On `complete()` we extend the TTL to 24h so post-mortems work.
+
+local cjson    = require("cjson.safe")
+local redis    = require("agent_mux.redis_client")
+local messages = require("agent_mux.session.messages")
+local log      = require("agent_mux.observability.log")
 
 local _M = {}
 
-function _M.create(_req)
-    error("session.store.create() not implemented yet — week 1 milestone")
+local SCHEMA_VERSION = 1
+local KEY_PREFIX     = "session:"
+local TTL_RUNNING    = 3600          -- 1h
+local TTL_COMPLETED  = 86400         -- 24h
+
+local function now_ts() return ngx.time() end
+
+-- session_id: 24 hex chars from random bytes. Sufficient for v0.1; the
+-- caller can always supply their own via the request body.
+local function gen_id()
+    -- math.random in OpenResty workers is seeded per-worker; that's fine
+    -- for non-security identifiers.
+    local parts = {}
+    for i = 1, 6 do parts[i] = string.format("%04x", math.random(0, 0xffff)) end
+    return "sess_" .. table.concat(parts)
 end
 
-function _M.load(_session_id)
-    error("session.store.load() not implemented yet — week 1 milestone")
+local function key_for(session_id) return KEY_PREFIX .. session_id end
+
+-- Wrap a plain table with a metatable that exposes mutation helpers. The
+-- agent loop and server use only this surface; raw table fields are read-only
+-- by convention.
+local Session = {}
+Session.__index = Session
+
+function Session:append_user(content)
+    table.insert(self.messages, messages.user(content))
+    self.updated_at = now_ts()
 end
 
-function _M.flush(_session)
-    error("session.store.flush() not implemented yet — week 1 milestone")
+function Session:append_assistant(response)
+    table.insert(self.messages, messages.assistant_from_response(response))
+    if response.usage then
+        self.usage.input_tokens  = (self.usage.input_tokens  or 0) + (response.usage.input_tokens  or 0)
+        self.usage.output_tokens = (self.usage.output_tokens or 0) + (response.usage.output_tokens or 0)
+    end
+    self.stop_reason = response.stop_reason
+    self.updated_at = now_ts()
 end
 
-function _M.complete(_session)
-    error("session.store.complete() not implemented yet — week 1 milestone")
+-- Week 2 will use this. Keeping it here so the loop's shape is symmetric.
+function Session:append_user_with_tool_results(results)
+    table.insert(self.messages, messages.user_with_tool_results(results))
+    self.updated_at = now_ts()
+end
+
+-- Encode just the persistable fields. Methods (Session metatable) are dropped.
+local function encode_doc(s)
+    return cjson.encode({
+        id              = s.id,
+        schema_version  = s.schema_version,
+        model           = s.model,
+        agent_id        = s.agent_id,
+        org_id          = s.org_id,
+        messages        = s.messages,
+        tools           = s.tools,
+        tool_policy     = s.tool_policy,
+        usage           = s.usage,
+        budget          = s.budget,
+        status          = s.status,
+        stop_reason     = s.stop_reason,
+        created_at      = s.created_at,
+        updated_at      = s.updated_at,
+    })
+end
+
+local function wrap(doc)
+    return setmetatable(doc, Session)
+end
+
+-- Create a new session and persist it. `req` is the parsed request body
+-- plus headers we care about; minimum required keys are `model` and `messages`.
+function _M.create(req)
+    assert(req.model,    "session.create: req.model is required")
+    assert(req.messages, "session.create: req.messages is required")
+
+    local s = wrap({
+        id              = req.session_id or gen_id(),
+        schema_version  = SCHEMA_VERSION,
+        model           = req.model,
+        agent_id        = req.agent_id,
+        org_id          = req.org_id,
+        messages        = req.messages,
+        tools           = req.tools or {},
+        tool_policy     = req.tool_policy or { mode = "allow_all" },
+        usage           = { input_tokens = 0, output_tokens = 0 },
+        budget          = req.budget or {
+            max_tokens     = 200000,
+            wall_clock_ms  = 600000,
+        },
+        status          = "running",
+        created_at      = now_ts(),
+        updated_at      = now_ts(),
+    })
+
+    local ok, err = _M.flush(s)
+    if not ok then return nil, err end
+    log.info("session_created", { session_id = s.id, model = s.model })
+    return s
+end
+
+-- Load a session by id. Returns nil + "not_found" if missing.
+function _M.load(session_id)
+    local r, err = redis.connect()
+    if not r then return nil, err end
+    local raw, gerr = r:get(key_for(session_id))
+    redis.release(r)
+
+    if gerr then return nil, gerr end
+    if raw == ngx.null or raw == nil then return nil, "not_found" end
+
+    local doc, derr = cjson.decode(raw)
+    if not doc then return nil, "decode: " .. tostring(derr) end
+
+    -- Schema-version guard: future migrations live here.
+    if doc.schema_version ~= SCHEMA_VERSION then
+        log.warn("session_schema_drift", {
+            session_id = session_id,
+            on_disk    = doc.schema_version,
+            expected   = SCHEMA_VERSION,
+        })
+    end
+    return wrap(doc)
+end
+
+-- Persist `s` to Redis. v0.1 flushes on every state transition; week 4
+-- introduces debouncing once metrics show this matters.
+function _M.flush(s)
+    local r, err = redis.connect()
+    if not r then return false, err end
+    local ttl = (s.status == "running") and TTL_RUNNING or TTL_COMPLETED
+    local ok, serr = r:set(key_for(s.id), encode_doc(s), "EX", ttl)
+    redis.release(r)
+    if not ok then return false, serr end
+    return true
+end
+
+-- Mark terminal status, write back with extended TTL.
+function _M.complete(s, stop_reason)
+    s.status      = "completed"
+    s.stop_reason = stop_reason or s.stop_reason
+    s.updated_at  = now_ts()
+    return _M.flush(s)
+end
+
+function _M.cancel(s)
+    s.status     = "cancelled"
+    s.updated_at = now_ts()
+    return _M.flush(s)
+end
+
+function _M.error(s, err_msg)
+    s.status      = "errored"
+    s.stop_reason = "error: " .. tostring(err_msg)
+    s.updated_at  = now_ts()
+    return _M.flush(s)
+end
+
+-- Test/CLI hook: render the persisted JSON for `/v1/sessions/:id`.
+function _M.to_json(s)
+    return encode_doc(s)
 end
 
 return _M
