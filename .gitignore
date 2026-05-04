@@ -1,0 +1,27 @@
+# OpenResty / nginx runtime artefacts
+logs/
+run/
+*.pid
+
+# Lua build artefacts
+*.rock
+.luarocks/
+luacov.*.out
+luacov.report.out
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local env overrides
+.env
+.env.local
+
+# Test artefacts
+results/
+.busted/
+
+docs/

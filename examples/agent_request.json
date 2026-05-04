@@ -1,0 +1,11 @@
+{
+  "model": "mock-claude",
+  "messages": [
+    { "role": "user", "content": "Hello — please introduce yourself briefly." }
+  ],
+  "tools": [],
+  "stream": true,
+  "metadata": {
+    "agent_id": "alice"
+  }
+}
