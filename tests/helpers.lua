@@ -58,6 +58,23 @@ function M.install_ngx_stub()
             read_body  = function() end,
             get_body_data = function() return "" end,
         },
+
+        -- Synchronous stand-in for ngx.thread so the dispatcher's
+        -- concurrent path is exercised without OpenResty. We capture the
+        -- function + args at spawn time and run them on wait.
+        thread   = {
+            spawn = function(fn, ...)
+                local args = { n = select("#", ...), ... }
+                return { _fn = fn, _args = args }
+            end,
+            wait  = function(th)
+                local results = { pcall(th._fn, table.unpack(th._args, 1, th._args.n)) }
+                if results[1] then
+                    return true, results[2]
+                end
+                return false, results[2]
+            end,
+        },
     }
 
     -- nginx exposes status as a property; tests can read it back via captured.
