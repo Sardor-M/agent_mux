@@ -103,6 +103,15 @@ function _M.bootstrap(config)
             end
         end
     end
+    if config.mcp and config.mcp.manifests then
+        local mcp = require("agent_mux.tools.mcp")
+        for _, manifest_path in ipairs(config.mcp.manifests) do
+            local ok, err = pcall(mcp.load_manifest, manifest_path)
+            if not ok then
+                ngx.log(ngx.WARN, "mcp.load_manifest(", manifest_path, ") failed: ", err)
+            end
+        end
+    end
 end
 
 function _M._reset_for_test() _tools = {} end

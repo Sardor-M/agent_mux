@@ -19,9 +19,11 @@
 --   tool_dispatch_start    count
 --   tool_dispatch_complete count, errors
 
-local registry = require("agent_mux.tools.registry")
-local metrics  = require("agent_mux.observability.metrics")
-local log      = require("agent_mux.observability.log")
+local registry  = require("agent_mux.tools.registry")
+local auth      = require("agent_mux.policy.auth")
+local ratelimit = require("agent_mux.policy.ratelimit")
+local metrics   = require("agent_mux.observability.metrics")
+local log       = require("agent_mux.observability.log")
 
 local _M = {}
 
@@ -59,28 +61,43 @@ local function run_one(session, use, sse)
         return out
     end
 
-    -- 2) Authorisation. Week 3 wires `policy.auth.is_allowed`; for v0.1
-    -- of week 2 we honour an `allow` list on the session if present.
-    if session.tool_policy and session.tool_policy.allow then
-        local ok = false
-        for _, n in ipairs(session.tool_policy.allow) do
-            if n == use.name then ok = true; break end
-        end
-        if not ok then
-            local out = {
-                tool_use_id = use.id,
-                content     = "permission_denied: " .. use.name,
-                is_error    = true,
-            }
-            sse:emit("tool_result", {
-                id          = use.id, name = use.name,
-                content     = out.content, is_error = true,
-                latency_ms  = now_ms() - started,
-            })
-            metrics.inc("agent_mux_tool_calls_total",
-                { name = use.name, outcome = "denied" })
-            return out
-        end
+    -- 2) Authorisation via policy/auth.lua. Reads session.tool_policy
+    -- and applies allow/deny resolution rules.
+    local allowed, reason = auth.check(session, use.name)
+    if not allowed then
+        local out = {
+            tool_use_id = use.id,
+            content     = "permission_denied: " .. tostring(reason),
+            is_error    = true,
+        }
+        sse:emit("tool_result", {
+            id          = use.id, name = use.name,
+            content     = out.content, is_error = true,
+            latency_ms  = now_ms() - started,
+        })
+        metrics.inc("agent_mux_tool_calls_total",
+            { name = use.name, outcome = "denied" })
+        return out
+    end
+
+    -- 2b) Rate limit via Redis Lua token bucket. Per (session, tool).
+    local rl_ok, rl_remaining, rl_retry_ms = ratelimit.try_consume(session, use.name, manifest)
+    if not rl_ok then
+        local out = {
+            tool_use_id = use.id,
+            content     = ("rate_limited: retry after %d ms"):format(rl_retry_ms),
+            is_error    = true,
+        }
+        sse:emit("tool_result", {
+            id             = use.id, name = use.name,
+            content        = out.content, is_error = true,
+            latency_ms     = now_ms() - started,
+            retry_after_ms = rl_retry_ms,
+            remaining      = rl_remaining,
+        })
+        metrics.inc("agent_mux_tool_calls_total",
+            { name = use.name, outcome = "rate_limited" })
+        return out
     end
 
     -- 3) Execute. pcall contains a buggy handler so it cannot kill the loop.
