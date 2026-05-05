@@ -1,0 +1,11 @@
+{
+  "servers": [
+    {
+      "name": "demo",
+      "command": "python3",
+      "args": ["examples/tools/mcp_demo/server.py"],
+      "tool_prefix": "demo",
+      "timeout_ms": 5000
+    }
+  ]
+}
