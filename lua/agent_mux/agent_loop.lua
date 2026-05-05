@@ -13,6 +13,7 @@ local upstream   = require("agent_mux.upstream.anthropic")
 local store      = require("agent_mux.session.store")
 local registry   = require("agent_mux.tools.registry")
 local dispatcher = require("agent_mux.tools.dispatcher")
+local budget     = require("agent_mux.session.budget")
 local metrics    = require("agent_mux.observability.metrics")
 local log        = require("agent_mux.observability.log")
 local errors     = require("agent_mux.errors")
@@ -96,6 +97,16 @@ function _M:run(sse)
             return
         end
 
+        -- Cancellation check at turn boundary. If a DELETE /v1/sessions/:id
+        -- arrived since the last turn, abort cleanly with a typed event.
+        if store.is_cancel_requested(self.session) then
+            sse:emit("cancelled", { turns = turn_n - 1 })
+            store.cancel(self.session)
+            store.clear_cancel_signal(self.session.id)
+            metrics.inc("agent_mux_sessions_total", { status = "cancelled" })
+            return
+        end
+
         local response, err = call_one_turn(self, sse, turn_n)
         if not response then
             log.error("upstream_failed", { session_id = self.session.id, err = err })
@@ -106,6 +117,24 @@ function _M:run(sse)
             metrics.inc("agent_mux_turns_total", {
                 model = self.session.model, stop_reason = "error",
             })
+            return
+        end
+
+        -- Budget enforcement: charge the just-finished turn against the
+        -- session cap. If exceeded, terminate cleanly with a typed event
+        -- — the model already produced output, so we honour this turn but
+        -- refuse the next one.
+        local turn_tokens = ((response.usage or {}).input_tokens  or 0)
+                          + ((response.usage or {}).output_tokens or 0)
+        local ok_budget, used, remaining = budget.try_consume(self.session, turn_tokens)
+        if not ok_budget then
+            sse:emit("done", {
+                stop_reason = "budget_exhausted",
+                turns       = turn_n,
+                used_tokens = used,
+                cap_tokens  = used + remaining,
+            })
+            store.complete(self.session, "budget_exhausted")
             return
         end
 

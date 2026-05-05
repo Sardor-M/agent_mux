@@ -10,12 +10,13 @@
 --   log_phase()      — one structured log line per request.
 --   handle_session() — non-streaming session introspection / cancel.
 
-local cjson      = require("cjson.safe")
-local errors     = require("agent_mux.errors")
-local log        = require("agent_mux.observability.log")
-local sse_mod    = require("agent_mux.transport.sse")
-local AgentLoop  = require("agent_mux.agent_loop")
-local store      = require("agent_mux.session.store")
+local cjson       = require("cjson.safe")
+local errors      = require("agent_mux.errors")
+local log         = require("agent_mux.observability.log")
+local sse_mod     = require("agent_mux.transport.sse")
+local AgentLoop   = require("agent_mux.agent_loop")
+local store       = require("agent_mux.session.store")
+local concurrency = require("agent_mux.session.concurrency")
 
 local _M = {}
 
@@ -66,6 +67,17 @@ function _M.access()
         return errors.respond(500, "session_create_failed", serr)
     end
 
+    -- Per-org concurrency cap. If full, the session doc is left with
+    -- status="running" but no slot — release is idempotent so log_phase
+    -- won't break. We immediately mark it errored before responding
+    -- so the user sees a clean state.
+    local claimed, current = concurrency.claim(session)
+    if not claimed then
+        store.error(session, "concurrency_cap_exceeded")
+        return errors.respond(429, "concurrency_cap",
+            string.format("org has %d concurrent sessions; cap reached", current))
+    end
+
     ngx.ctx.session = session
 end
 
@@ -99,6 +111,11 @@ end
 -- Phase 3: log. Always runs, even on early exit. Keep cheap.
 function _M.log_phase()
     local started = ngx.ctx.started_at_ms
+    if ngx.ctx.session then
+        -- Best-effort release. Idempotent — if the slot wasn't held (e.g.
+        -- concurrency cap rejected the request), this is a no-op.
+        concurrency.release(ngx.ctx.session)
+    end
     if started then
         log.info("request", {
             uri        = ngx.var.uri,
@@ -129,7 +146,28 @@ function _M.handle_session()
         ngx.say(store.to_json(s))
         return
     elseif method == "DELETE" then
-        return errors.respond(501, "not_implemented", "session cancellation arrives in week 3")
+        -- Best-effort: load to confirm existence; signal cancel.
+        local s, err = store.load(session_id)
+        if not s then
+            if err == "not_found" then
+                return errors.respond(404, "not_found", "session " .. session_id)
+            end
+            return errors.respond(500, "session_load_failed", err)
+        end
+        if s.status ~= "running" then
+            -- Already terminal — idempotent response.
+            ngx.header["Content-Type"] = "application/json"
+            ngx.say(string.format(
+                '{"status":"%s","note":"session already terminal"}', s.status))
+            return
+        end
+        local ok, serr = store.signal_cancel(session_id)
+        if not ok then
+            return errors.respond(500, "signal_failed", serr)
+        end
+        ngx.header["Content-Type"] = "application/json"
+        ngx.say('{"status":"cancelling","note":"signal sent; loop will abort at next turn boundary"}')
+        return
     else
         return errors.respond(405, "method_not_allowed", method)
     end

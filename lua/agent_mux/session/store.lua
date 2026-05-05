@@ -73,20 +73,21 @@ end
 -- Encode just the persistable fields. Methods (Session metatable) are dropped.
 local function encode_doc(s)
     return cjson.encode({
-        id              = s.id,
-        schema_version  = s.schema_version,
-        model           = s.model,
-        agent_id        = s.agent_id,
-        org_id          = s.org_id,
-        messages        = s.messages,
-        tools           = s.tools,
-        tool_policy     = s.tool_policy,
-        usage           = s.usage,
-        budget          = s.budget,
-        status          = s.status,
-        stop_reason     = s.stop_reason,
-        created_at      = s.created_at,
-        updated_at      = s.updated_at,
+        id                = s.id,
+        schema_version    = s.schema_version,
+        model             = s.model,
+        agent_id          = s.agent_id,
+        org_id            = s.org_id,
+        messages          = s.messages,
+        tools             = s.tools,
+        tool_policy       = s.tool_policy,
+        usage             = s.usage,
+        budget            = s.budget,
+        status            = s.status,
+        stop_reason       = s.stop_reason,
+        cancel_requested  = s.cancel_requested or nil,
+        created_at        = s.created_at,
+        updated_at        = s.updated_at,
     })
 end
 
@@ -173,6 +174,43 @@ function _M.cancel(s)
     s.status     = "cancelled"
     s.updated_at = now_ts()
     return _M.flush(s)
+end
+
+-- Signal a running session to cancel itself. Writes a single field via a
+-- dedicated key namespace so we don't need to read-modify-write the whole
+-- doc — the agent loop's worker may be holding the doc in memory and
+-- our flush would lose its in-flight changes.
+--
+-- The loop checks the cancel signal between turns by reading this key.
+function _M.signal_cancel(session_id)
+    local r, err = redis.connect()
+    if not r then return false, err end
+    -- 60s TTL: by then either the loop noticed and acked, or the session
+    -- itself has TTL'd out.
+    local ok, serr = r:set("cancel:session:" .. session_id, "1", "EX", 60)
+    redis.release(r)
+    if not ok then return false, serr end
+    return true
+end
+
+-- Cheap probe — single GET of a small string. Called from agent_loop
+-- once per turn (i.e. at most a few times per minute per session).
+function _M.is_cancel_requested(session)
+    local r, err = redis.connect()
+    if not r then return false end
+    local v, gerr = r:get("cancel:session:" .. session.id)
+    redis.release(r)
+    if gerr then return false end
+    return v == "1"
+end
+
+-- Clear the cancel signal once we've acted on it. Best-effort — the
+-- 60s TTL is the safety net.
+function _M.clear_cancel_signal(session_id)
+    local r, err = redis.connect()
+    if not r then return end
+    r:del("cancel:session:" .. session_id)
+    redis.release(r)
 end
 
 function _M.error(s, err_msg)
