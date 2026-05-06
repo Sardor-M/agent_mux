@@ -22,6 +22,7 @@
 local registry  = require("agent_mux.tools.registry")
 local auth      = require("agent_mux.policy.auth")
 local ratelimit = require("agent_mux.policy.ratelimit")
+local hooks     = require("agent_mux.hooks.runtime")
 local metrics   = require("agent_mux.observability.metrics")
 local log       = require("agent_mux.observability.log")
 
@@ -101,6 +102,9 @@ local function run_one(session, use, sse)
     end
 
     -- 3) Execute. pcall contains a buggy handler so it cannot kill the loop.
+    -- Hook: pre_tool. May mutate use.input.
+    hooks.fire("pre_tool", { session = session, use = use, manifest = manifest })
+
     local ok, result = pcall(manifest.run, use.input, {
         session     = session,
         deadline_ms = manifest.timeout_ms,
@@ -132,18 +136,24 @@ local function run_one(session, use, sse)
         }
     end
 
+    local latency_ms = now_ms() - started
     sse:emit("tool_result", {
         id          = use.id,
         name        = use.name,
         content     = out.content,
         is_error    = out.is_error and true or nil,
-        latency_ms  = now_ms() - started,
+        latency_ms  = latency_ms,
     })
+
+    -- Hook: post_tool. Read-only-by-convention.
+    hooks.fire("post_tool", { session = session, use = use, manifest = manifest, result = out })
 
     metrics.inc("agent_mux_tool_calls_total", {
         name    = use.name,
         outcome = out.is_error and "error" or "ok",
     })
+    metrics.observe("agent_mux_tool_latency_seconds",
+        { name = use.name }, latency_ms / 1000)
     return out
 end
 
