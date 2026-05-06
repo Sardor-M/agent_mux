@@ -1,0 +1,22 @@
+================================================================
+AgentMux bench — BASELINE PLACEHOLDER
+================================================================
+
+This file holds the recorded baseline numbers for `make bench` to
+compare against. Pin a clean run by:
+
+    make demo                # (in another terminal)
+    bash scripts/bench.sh
+    cp bench/run_<ts>.txt bench/baseline.txt
+
+Expected ballpark on a 2024-class laptop with the mock upstream and
+no Redis backpressure:
+
+  /healthz       ~10k req/s, P99 < 2 ms
+  /metrics       ~ 8k req/s, P99 < 3 ms
+  /v1/agents     ~  500 req/s, P99 < 50 ms   (mock upstream paces with ngx.sleep)
+
+Production tuning (lua_code_cache=on, multiple workers) typically
+adds ~30% throughput across the board.
+
+These numbers will be replaced when the first real bench run is pinned.

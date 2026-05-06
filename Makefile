@@ -29,6 +29,9 @@ test:                  ## Run busted unit tests
 	@command -v busted >/dev/null || { echo "busted not found — luarocks install busted"; exit 1; }
 	busted tests/
 
+bench:                 ## Run wrk against /healthz, /metrics, /v1/agents
+	@bash scripts/bench.sh
+
 fmt:                   ## Format Lua sources with stylua if available
 	@command -v stylua >/dev/null && stylua lua/ tests/ examples/ || echo "stylua not installed — skipping"
 
