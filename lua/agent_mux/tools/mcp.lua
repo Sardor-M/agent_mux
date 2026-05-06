@@ -33,9 +33,29 @@ local _M = {}
 -- One process per MCP server, alive for the lifetime of the worker.
 -- Keyed by server name so we can re-use the connection across
 -- many tools/call invocations.
+--
+-- Each entry shape:
+--   { proc, info, spec, attempts, last_attempt_ms }
 local _servers = {}
 
 local DEFAULT_TIMEOUT_MS = 5000
+
+-- Exponential backoff on respawn — caps at 30s so a permanently broken
+-- server doesn't hammer the host but we keep retrying eventually.
+local function backoff_ms(attempts)
+    return math.min(30000, (2 ^ math.min(attempts, 8)) * 100)
+end
+
+-- Probe an MCP server's subprocess. Returns true if it's running and
+-- usable, false if it has died or was never spawned.
+local function is_alive(entry)
+    if not entry or not entry.proc then return false end
+    -- ngx.pipe procs expose `pid` while running; reading it returns nil
+    -- once the proc has exited or signaled.
+    local ok = pcall(function() return entry.proc:pid() end)
+    if not ok then return false end
+    return entry.proc:pid() ~= nil
+end
 
 -- Read newline-delimited JSON. Returns nil on EOF / timeout.
 local function read_message(proc)
@@ -92,6 +112,21 @@ local function make_tool_manifest(server, mcp_tool, prefix)
             local entry = _servers[server.name]
             if not entry then
                 return { is_error = true, content = "mcp server not running: " .. server.name }
+            end
+
+            -- Detect dead proc and attempt respawn. If the respawn
+            -- succeeds, the tool name we hold may have been re-registered
+            -- against a fresh manifest — that's fine, our closure still
+            -- finds the new entry on the next lookup.
+            if not is_alive(entry) then
+                local ok, rerr = respawn_if_due(server.name)
+                if not ok then
+                    return {
+                        is_error = true,
+                        content  = "mcp_server_dead: " .. server.name .. " — " .. tostring(rerr),
+                    }
+                end
+                entry = _servers[server.name]
             end
 
             local req = jsonrpc.request("tools/call", {
@@ -158,7 +193,16 @@ local function bring_up(server)
         return nil, "tools/list: " .. tostring(lerr)
     end
 
-    _servers[server.name] = { proc = proc, info = init_res }
+    -- Preserve attempt counter across respawns so backoff escalates;
+-- reset on the first successful registration after respawn (in respawn()).
+local existing = _servers[server.name]
+_servers[server.name] = {
+    proc            = proc,
+    info            = init_res,
+    spec            = server,
+    attempts        = (existing and existing.attempts) or 0,
+    last_attempt_ms = ngx.now() * 1000,
+}
 
     -- 4. register every discovered tool
     local registered = {}
@@ -173,6 +217,41 @@ local function bring_up(server)
     end
 
     return registered
+end
+
+-- Try to respawn a dead MCP server. Honours backoff so a perpetually
+-- broken process doesn't get hammered. Returns true on success.
+local function respawn_if_due(server_name)
+    local entry = _servers[server_name]
+    if not entry then return false, "no spec for " .. server_name end
+    if not entry.spec then return false, "no spec for " .. server_name end
+
+    local now_ms      = ngx.now() * 1000
+    local since_last  = now_ms - (entry.last_attempt_ms or 0)
+    local needed_wait = backoff_ms(entry.attempts or 0)
+    if since_last < needed_wait then
+        return false, ("backoff: %dms remaining"):format(needed_wait - since_last)
+    end
+
+    entry.attempts = (entry.attempts or 0) + 1
+    entry.last_attempt_ms = now_ms
+    ngx.log(ngx.WARN, "mcp_server_died: respawning ", server_name,
+                      " (attempt ", entry.attempts, ")")
+
+    local registered, err = bring_up(entry.spec)
+    if not registered then
+        ngx.log(ngx.WARN, "mcp respawn failed for ", server_name, ": ", err)
+        return false, err
+    end
+
+    -- Success — reset attempt counter so the next failure starts at full
+    -- backoff window again rather than pinning at the cap.
+    if _servers[server_name] then
+        _servers[server_name].attempts = 0
+    end
+    ngx.log(ngx.INFO, "mcp_server_respawned: ", server_name,
+                      " (", #registered, " tools re-registered)")
+    return true
 end
 
 -- Read and validate the config file, then bring up every server.
