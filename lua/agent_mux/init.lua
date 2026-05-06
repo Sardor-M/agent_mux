@@ -49,7 +49,15 @@ end
 function _M.init_worker()
     local ok, err = pcall(function()
         require("agent_mux.observability.metrics").init()
+        require("agent_mux.policy.auth_request").init()
         require("agent_mux.tools.registry").bootstrap(default_config())
+
+        -- Load hooks from the configured directory. AGENT_MUX_HOOKS_DIR
+        -- can be empty / unset to disable hooks entirely.
+        local hooks_dir = os.getenv("AGENT_MUX_HOOKS_DIR") or "examples/hooks"
+        if hooks_dir ~= "" then
+            require("agent_mux.hooks.loader").load_dir(hooks_dir)
+        end
 
         -- Load Redis Lua scripts. We swallow Redis-down errors so a
         -- temporarily-unavailable Redis doesn't block the worker from

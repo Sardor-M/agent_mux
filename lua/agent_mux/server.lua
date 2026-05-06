@@ -17,6 +17,8 @@ local sse_mod     = require("agent_mux.transport.sse")
 local AgentLoop   = require("agent_mux.agent_loop")
 local store       = require("agent_mux.session.store")
 local concurrency = require("agent_mux.session.concurrency")
+local auth_req    = require("agent_mux.policy.auth_request")
+local ip_ratelimit = require("agent_mux.policy.ip_ratelimit")
 
 local _M = {}
 
@@ -51,6 +53,23 @@ function _M.access()
 
     if ngx.req.get_method() ~= "POST" then
         return errors.respond(405, "method_not_allowed", ngx.req.get_method())
+    end
+
+    -- Request-level auth (API key). Runs first so an unauthenticated
+    -- caller never causes any Redis writes or upstream calls.
+    local auth_ok, auth_reason = auth_req.check()
+    if not auth_ok then
+        return errors.respond(401, "unauthorized", auth_reason)
+    end
+
+    -- Per-IP rate limit. After auth so we don't waste a Redis hit on a
+    -- request we'd reject anyway. Returns 429 with Retry-After header
+    -- per the HTTP spec.
+    local ip_ok, retry_ms = ip_ratelimit.check()
+    if not ip_ok then
+        ngx.header["Retry-After"] = math.ceil(retry_ms / 1000)
+        return errors.respond(429, "ip_rate_limited",
+            ("retry after %d ms"):format(retry_ms))
     end
 
     local body, err = parse_request_body()
