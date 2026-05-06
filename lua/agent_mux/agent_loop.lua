@@ -14,6 +14,7 @@ local store      = require("agent_mux.session.store")
 local registry   = require("agent_mux.tools.registry")
 local dispatcher = require("agent_mux.tools.dispatcher")
 local budget     = require("agent_mux.session.budget")
+local hooks      = require("agent_mux.hooks.runtime")
 local metrics    = require("agent_mux.observability.metrics")
 local log        = require("agent_mux.observability.log")
 local errors     = require("agent_mux.errors")
@@ -35,6 +36,9 @@ local function call_one_turn(self, sse, turn_n)
 
     sse:emit("turn_start", { turn = turn_n })
 
+    -- Hook: pre_llm. May mutate session.messages (e.g. PII redaction).
+    hooks.fire("pre_llm", { session = self.session, turn = turn_n })
+
     local response, err = upstream.call(
         self.session.model,
         self.session.messages,
@@ -49,8 +53,12 @@ local function call_one_turn(self, sse, turn_n)
     )
 
     if not response then
+        hooks.fire("on_error", { session = self.session, turn = turn_n, err = err })
         return nil, err
     end
+
+    -- Hook: post_llm. Read-only-by-convention inspection point.
+    hooks.fire("post_llm", { session = self.session, turn = turn_n, response = response })
 
     self.session:append_assistant(response)
     local ok, ferr = store.flush(self.session)
@@ -58,15 +66,18 @@ local function call_one_turn(self, sse, turn_n)
         log.warn("session_flush_failed", { session_id = self.session.id, err = ferr })
     end
 
+    local latency_ms = ngx.now() * 1000 - started_ms
     sse:emit("turn_complete", {
         turn        = turn_n,
         stop_reason = response.stop_reason,
         usage       = response.usage,
-        latency_ms  = ngx.now() * 1000 - started_ms,
+        latency_ms  = latency_ms,
     })
     metrics.inc("agent_mux_turns_total", {
         model = self.session.model, stop_reason = response.stop_reason or "unknown",
     })
+    metrics.observe("agent_mux_llm_latency_seconds",
+        { model = self.session.model }, latency_ms / 1000)
     if response.usage then
         metrics.inc("agent_mux_tokens_total",
             { direction = "input",  model = self.session.model },
@@ -104,7 +115,27 @@ function _M:run(sse)
             store.cancel(self.session)
             store.clear_cancel_signal(self.session.id)
             metrics.inc("agent_mux_sessions_total", { status = "cancelled" })
+            hooks.fire("on_cancel", { session = self.session, turns = turn_n - 1 })
             return
+        end
+
+        -- Wall-clock timeout. Defensive guard against a session that's
+        -- not budget-bound but has been running too long. Default cap is
+        -- 10 min in session/store.lua; override via request.budget.wall_clock_ms.
+        local cap_ms = self.session.budget and self.session.budget.wall_clock_ms
+        if cap_ms and cap_ms > 0 then
+            local elapsed_ms = (ngx.now() * 1000) - (self.session.created_at * 1000)
+            if elapsed_ms > cap_ms then
+                sse:emit("done", {
+                    stop_reason     = "wall_clock_exhausted",
+                    turns           = turn_n - 1,
+                    elapsed_ms      = math.floor(elapsed_ms),
+                    wall_clock_ms   = cap_ms,
+                })
+                store.complete(self.session, "wall_clock_exhausted")
+                metrics.inc("agent_mux_sessions_total", { status = "wall_clock_exhausted" })
+                return
+            end
         end
 
         local response, err = call_one_turn(self, sse, turn_n)
@@ -143,6 +174,7 @@ function _M:run(sse)
         if stop == "end_turn" or stop == "stop_sequence" or stop == "max_tokens" then
             sse:emit("done", { stop_reason = stop, turns = turn_n })
             store.complete(self.session, stop)
+            hooks.fire("on_done", { session = self.session, stop_reason = stop, turns = turn_n })
             return
         end
 
