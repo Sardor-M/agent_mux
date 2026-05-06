@@ -1,0 +1,119 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Lua unit tests (busted)
+    runs-on: ubuntu-latest
+
+    services:
+      # Redis is started for tests that hit the network. Pure-Lua tests
+      # use the ngx stub from tests/helpers.lua and don't need it, but
+      # leaving it on means the integration test row works without
+      # restructuring matrix.
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    env:
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua 5.1 + LuaRocks
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.1 liblua5.1-dev luarocks
+
+      - name: Install test deps
+        run: |
+          sudo luarocks install --lua-version=5.1 busted
+          sudo luarocks install --lua-version=5.1 luasocket
+          sudo luarocks install --lua-version=5.1 lua-cjson
+          sudo luarocks install --lua-version=5.1 luasec
+
+      - name: Run busted
+        run: busted tests/
+
+  smoke-test:
+    name: Demo boot + curl smoke test
+    runs-on: ubuntu-latest
+    needs: unit-tests
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenResty
+        run: |
+          wget -qO - https://openresty.org/package/pubkey.gpg | sudo apt-key add -
+          sudo add-apt-repository -y "deb http://openresty.org/package/ubuntu $(lsb_release -sc) main"
+          sudo apt-get update
+          sudo apt-get install -y openresty
+
+      - name: Boot OpenResty
+        env:
+          REDIS_HOST: 127.0.0.1
+          AGENT_MUX_API_KEYS: ci-test-key
+        run: |
+          mkdir -p logs run
+          openresty -p "$PWD/" -c "$PWD/conf/nginx.conf" -g 'daemon on;'
+          sleep 1
+
+      - name: Smoke /healthz
+        run: |
+          curl -fsS localhost:8080/healthz | grep -q "^ok$"
+
+      - name: Smoke /metrics
+        run: |
+          curl -fsS localhost:8080/metrics | grep -q '^agent_mux_build_info'
+          curl -fsS localhost:8080/metrics | grep -q '^agent_mux_redis_up'
+
+      - name: Auth required on /v1/agents
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -X POST -H 'Content-Type: application/json' \
+            -d '{"model":"x","messages":[{"role":"user","content":"hi"}]}' \
+            localhost:8080/v1/agents)
+          test "$status" = "401"
+
+      - name: Authenticated request reaches /v1/agents
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -X POST -H 'Content-Type: application/json' \
+            -H 'X-API-Key: ci-test-key' \
+            -d '{"model":"mock-claude","messages":[{"role":"user","content":"hi"}]}' \
+            localhost:8080/v1/agents)
+          # Mock upstream isn't reachable from /v1/agents in this CI run
+          # because mock_anthropic.lua serves on the same nginx; the loop
+          # will hit the local mock URL which IS reachable. Expect 200.
+          test "$status" = "200"
+
+      - name: Tail nginx logs on failure
+        if: failure()
+        run: |
+          echo "--- error.log ---"
+          tail -200 logs/error.log || true
+          echo "--- access.log ---"
+          tail -50 logs/access.log || true
