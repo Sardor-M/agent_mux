@@ -31,6 +31,8 @@ function _M.claim(session, opts)
 
     if not res then
         ngx.log(ngx.WARN, "concurrency_claim script failed (fail-open): ", err)
+        require("agent_mux.observability.metrics")
+            .inc("agent_mux_fail_open_total", { component = "concurrency_claim" })
         return true, 0
     end
 

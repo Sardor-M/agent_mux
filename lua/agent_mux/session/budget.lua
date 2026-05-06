@@ -36,6 +36,8 @@ function _M.try_consume(session, tokens)
     if not res then
         -- Fail-open: do not let Redis flap take down chat.
         ngx.log(ngx.WARN, "budget_check script failed (fail-open): ", err)
+        require("agent_mux.observability.metrics")
+            .inc("agent_mux_fail_open_total", { component = "session_budget" })
         return true, 0, max_tokens
     end
 
