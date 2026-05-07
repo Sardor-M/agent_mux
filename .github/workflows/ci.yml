@@ -43,11 +43,10 @@ jobs:
           sudo luarocks install --lua-version=5.1 luasocket
           sudo luarocks install --lua-version=5.1 lua-cjson
           sudo luarocks install --lua-version=5.1 luasec
-          # lua-resty-* normally come bundled with OpenResty; install them
-          # explicitly here so modules that `require("resty.redis")` /
-          # `require("resty.http")` can be loaded under plain Lua 5.1.
-          sudo luarocks install --lua-version=5.1 lua-resty-redis
-          sudo luarocks install --lua-version=5.1 lua-resty-http
+          # We do NOT install lua-resty-redis / lua-resty-http: their
+          # module-load path touches ngx.socket.tcp which doesn't exist
+          # under plain Lua. tests/helpers.lua preloads no-op stand-ins
+          # instead — see install_ngx_stub().
 
       - name: Run busted
         run: busted tests/
