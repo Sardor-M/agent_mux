@@ -1,107 +1,157 @@
-# agent_mux
+# AgentMux
 
-A small, fast **agent harness** built on OpenResty/LuaJIT. It runs multi-turn
-LLM agent loops in a single nginx worker — streaming SSE to the client,
-dispatching tool calls (inline, HTTP, or MCP over JSON-RPC), and persisting
-session state in Redis.
+> **AgentMux runs your MCP servers in production — with auth, budgets,
+> rate limits, lifecycle, and observability — so you don't have to.**
 
-The point is to keep the loop, the tool plane, and the transport in one
-process so latency stays in the millisecond range and the operational surface
-stays small. No queue, no scheduler, no microservices — just nginx phases,
-cosockets, and Redis.
+Most teams adopting MCP end up rebuilding the same operational scaffolding:
+spawn the server, watch it crash, restart with backoff, route JSON-RPC, gate
+with auth, enforce per-tenant quotas, log every call, kill on budget breach.
+AgentMux is that scaffolding, shipped — a single OpenResty/LuaJIT process that
+supervises a fleet of MCP servers and exposes them through one streaming agent
+endpoint.
 
-## What works today
+The agent loop, the policy plane, and the MCP transport all live in the same
+worker, so latency stays in the millisecond range and the operational surface
+stays small. No queue, no scheduler, no microservices.
 
+## What you get
+
+**MCP supervision**
+- Subprocess lifecycle for stdio MCP servers — spawn, monitor, **respawn with
+  exponential backoff** on crash
+- JSON-RPC 2.0 framing over the stdio pipe
+- Tools from MCP servers join the same registry as inline Lua tools and HTTP
+  tools, behind one dispatcher
+- The same auth / per-tool rate limit / per-org concurrency / token budget
+  apply to MCP tool calls as to any other tool — no MCP-shaped policy holes
+
+**Agent runtime around it**
 - Multi-turn agent loop with a wall-clock timeout per session
-- Streaming Anthropic upstream + a mock upstream for local dev and tests
-- Tool dispatch — inline Lua, HTTP tools, and MCP servers spawned over stdio
-- Concurrent fan-out for tool calls inside one assistant turn
-- Sessions in Redis with cancellation (`DELETE /v1/sessions/:id`), per-session
-  token budgets, per-org concurrency slots, and a schema migration framework
-- Hooks runtime with hot reload — pre/post LLM and pre/post tool fire-points
+- Streaming Anthropic upstream (+ a mock upstream for local dev) returning
+  Server-Sent Events
+- Concurrent fan-out for tool calls inside a single assistant turn
+- Sessions in Redis with cancellation (`DELETE /v1/sessions/:id`),
+  per-session token budgets, per-org concurrency slots, schema migrations
+- Hooks runtime (pre/post LLM, pre/post tool) with hot reload — drop a Lua
+  file in `AGENT_MUX_HOOKS_DIR` and it picks up on next request
+
+**Operations**
 - API-key auth, per-IP rate limit, per-tool rate limit, tool authorisation
 - Prometheus metrics, OpenTelemetry spans, structured request logs
 - Graceful shutdown that drains in-flight sessions and emits a final `done`
   event before the worker exits
 - Request body size pre-check, redis health gauge, fail-open audit counter
-- CI on GitHub Actions (busted suite + redis), Claude PR review workflow
 
-## Run it locally
+## Quick start
 
 ```bash
-make check-deps         # verify openresty + redis are on PATH
-make demo               # boots redis and OpenResty together for an end-to-end run
+make check-deps                                    # openresty + redis on PATH
+export AGENT_MUX_API_KEYS=test-key
+export AGENT_MUX_MCP_FILE=examples/tools/mcp_servers.json
+make demo                                          # boots redis + OpenResty
 ```
 
-If you want to manage redis yourself:
+This boots redis on `:6390`, OpenResty on `:8080`, and supervises the demo
+MCP server (a Python stdio server in `examples/tools/mcp_demo/`).
+
+In a second terminal:
 
 ```bash
-make dev                # OpenResty in foreground on :8080
-```
+curl localhost:8080/healthz                        # → ok
+curl localhost:8080/metrics | grep agent_mux       # Prometheus exposition
 
-Sanity-check it:
-
-```bash
-curl localhost:8080/healthz                    # → ok
-curl localhost:8080/metrics                    # Prometheus exposition
 curl -N -X POST localhost:8080/v1/agents \
-     -H 'content-type: application/json' \
-     --data @examples/agent_request.json       # streams SSE
+     -H 'X-API-Key: test-key' \
+     -H 'Content-Type: application/json' \
+     --data @examples/agent_request.json           # streams SSE
 ```
 
-`Ctrl+C` to stop. `make stop` if you backgrounded it.
+## HTTP surface
 
-## HTTP routes
-
-| Route                         | What it does                                          |
-|-------------------------------|-------------------------------------------------------|
-| `POST /v1/agents`             | Start an agent run; streams SSE deltas + tool events  |
-| `DELETE /v1/sessions/:id`     | Cancel an in-flight session gracefully                |
-| `GET  /healthz`               | Liveness check + redis health probe                   |
-| `GET  /metrics`               | Prometheus exposition                                 |
-| `POST /mock/v1/messages`      | Local mock upstream for tests and the demo            |
+| Route                          | Purpose                                                    |
+|--------------------------------|------------------------------------------------------------|
+| `POST /v1/agents`              | Start an agent run; streams SSE deltas + tool events       |
+| `DELETE /v1/sessions/:id`      | Cancel an in-flight session gracefully                     |
+| `GET  /healthz`                | Liveness check + redis health probe                        |
+| `GET  /metrics`                | Prometheus exposition                                      |
+| `POST /mock/v1/messages`       | Local mock upstream for tests and demos                    |
 
 ## Layout
 
 ```
-conf/nginx.conf                OpenResty config — locations, phases, package path
+conf/nginx.conf                OpenResty config — env, locations, phases
 lua/agent_mux/
-  ├─ server.lua                access / content / log phases, graceful shutdown
-  ├─ agent_loop.lua            the multi-turn loop
-  ├─ errors.lua                shared error taxonomy
-  ├─ redis_client.lua          pooled cosocket client
-  ├─ upstream/                 Anthropic streaming client + SSE chunk parser
   ├─ tools/                    registry, dispatcher, inline / HTTP / MCP handlers
-  ├─ transport/                SSE encoder, JSON-RPC 2.0 framing for MCP stdio
+  │   └─ mcp.lua               stdio MCP client + subprocess respawn
+  ├─ transport/
+  │   ├─ jsonrpc.lua           JSON-RPC 2.0 framing for MCP stdio
+  │   └─ sse.lua               SSE encoder for client responses
+  ├─ agent_loop.lua            the multi-turn loop
+  ├─ server.lua                access / content / log phases, graceful shutdown
   ├─ session/                  store, messages, budget, concurrency, migrations
-  ├─ hooks/                    runtime + loader for pre/post LLM and pre/post tool
+  ├─ hooks/                    pre/post LLM and pre/post tool runtime + loader
   ├─ observability/            log, Prometheus metrics, OpenTelemetry spans
   ├─ policy/                   API-key auth, IP rate limit, tool rate limit + authz
-  └─ scripts/                  atomic Redis Lua scripts (budget, concurrency, RL)
-examples/                      mock upstream, sample tools, sample hooks, request body
-tests/                         busted unit + integration suite
+  ├─ upstream/                 LLM clients (Anthropic streaming, SSE chunk parser)
+  ├─ scripts/                  atomic Redis Lua scripts (budget, concurrency, RL)
+  ├─ redis_client.lua          pooled cosocket client + script registry
+  └─ errors.lua                shared error taxonomy
+examples/
+  ├─ tools/mcp_demo/           stdio MCP server in Python — supervised by AgentMux
+  ├─ tools/mcp_servers.json    MCP manifest the supervisor reads
+  ├─ tools/inline_calculator.lua, http_search/, http_tools.json
+  └─ hooks/audit_log.lua       reference audit hook
+tests/                         busted unit + integration suite (67 tests)
 bench/                         wrk harness + baseline output
 ```
-
-The `docs/` tree has longer write-ups for each subsystem if you want the why,
-not just the what.
 
 ## Prerequisites
 
 - **OpenResty 1.25+** — `brew install openresty/brew/openresty`
 - **Redis 7+** — `brew install redis`
 - **busted** for tests — `luarocks install busted`
+- **`lua-resty-http`** — not bundled with OpenResty; install via
+  `opm get ledgetech/lua-resty-http`
+- **Python 3.10+** if you want to run the demo MCP server
 - Optional: `wrk` for benchmarks, `stylua` for formatting
 
 ## Useful targets
 
 ```bash
 make help               # list everything
+make demo               # boot redis + OpenResty for an end-to-end run
+make dev                # OpenResty in foreground (you bring redis)
 make test               # busted unit + integration suite
 make bench              # wrk against /healthz, /metrics, /v1/agents
-make fmt                # stylua (if installed)
+make stop               # stop a backgrounded OpenResty
 make clean              # clear logs/ and run/
 ```
+
+## What's next
+
+Honest list of the gaps between what's shipped and full "MCP fleet manager"
+parity. None of these block the use cases above; they're the work that turns
+AgentMux into something an operations team can manage as a first-class
+service:
+
+- **`GET /v1/mcp/servers`** — list supervised servers with restart count,
+  in-flight calls, last-call latency, status. Right now you read
+  `logs/error.log` to see what MCP is doing.
+- **Hot-reload of `AGENT_MUX_MCP_FILE`** — add or replace an MCP server
+  without `make stop && make dev`.
+- **Per-MCP-server resource caps** — memory ceiling, max concurrent calls,
+  idle-timeout-then-respawn. Crash recovery (`feat(mcp): subprocess respawn
+  with exponential backoff`) is in; proactive bounds aren't.
+- **Live MCP traffic tail** — `GET /v1/mcp/servers/<name>/calls` (SSE) so
+  operators can watch a server in real time.
+- **`Dockerfile` + `docker-compose.yaml`** — one image, redis sidecar,
+  configurable MCP manifest. Today, deployment is "install OpenResty +
+  Redis, copy the repo, set env vars, run."
+- **Thin client libraries** — Python and TypeScript wrappers around
+  `/v1/agents` that yield SSE events as objects. Hand-rolling SSE in every
+  integration is friction we should absorb.
+- **More upstream providers** — only Anthropic today. OpenAI, Bedrock,
+  Gemini adapters are mechanical work.
 
 ## License
 
