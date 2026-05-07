@@ -108,6 +108,21 @@ function _M:run(sse)
             return
         end
 
+        -- Graceful shutdown check. nginx workers receive SIGQUIT during
+        -- `openresty -s quit`; ngx.worker.exiting() flips to true. We
+        -- finish the current loop iteration cleanly with a typed event
+        -- instead of letting the connection drop mid-stream.
+        if ngx.worker and ngx.worker.exiting and ngx.worker.exiting() then
+            sse:emit("done", {
+                stop_reason = "shutting_down",
+                turns       = turn_n - 1,
+                note        = "worker received graceful drain signal",
+            })
+            store.complete(self.session, "shutting_down")
+            metrics.inc("agent_mux_sessions_total", { status = "shutting_down" })
+            return
+        end
+
         -- Cancellation check at turn boundary. If a DELETE /v1/sessions/:id
         -- arrived since the last turn, abort cleanly with a typed event.
         if store.is_cancel_requested(self.session) then

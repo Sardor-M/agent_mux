@@ -32,6 +32,8 @@ function _M.try_consume(session, tool_name, manifest)
         -- quota in m365-fastapi-backend: a soft business control should
         -- not take chat down with it.
         ngx.log(ngx.WARN, "tool_ratelimit script failed (fail-open): ", err)
+        require("agent_mux.observability.metrics")
+            .inc("agent_mux_fail_open_total", { component = "tool_ratelimit" })
         return true, capacity, 0
     end
 

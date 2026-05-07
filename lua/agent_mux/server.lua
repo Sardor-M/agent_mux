@@ -47,12 +47,25 @@ local function parse_request_body()
     return body
 end
 
+-- Application-level body cap. Stricter than nginx's client_max_body_size
+-- (4 MB by default) so a pathological caller posting a huge message
+-- history is rejected before we waste cycles parsing JSON.
+local MAX_BODY_BYTES = tonumber(os.getenv("AGENT_MUX_MAX_BODY_BYTES")) or (256 * 1024)
+
 -- Phase 1: access.
 function _M.access()
     ngx.ctx.started_at_ms = ngx.now() * 1000
 
     if ngx.req.get_method() ~= "POST" then
         return errors.respond(405, "method_not_allowed", ngx.req.get_method())
+    end
+
+    -- Body size pre-check. Content-Length is best-effort (chunked requests
+    -- omit it); for chunked, nginx's client_max_body_size is the hard cap.
+    local cl = tonumber(ngx.req.get_headers()["Content-Length"])
+    if cl and cl > MAX_BODY_BYTES then
+        return errors.respond(413, "request_too_large",
+            string.format("body %d bytes exceeds %d byte cap", cl, MAX_BODY_BYTES))
     end
 
     -- Request-level auth (API key). Runs first so an unauthenticated

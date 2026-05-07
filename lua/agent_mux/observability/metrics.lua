@@ -92,6 +92,8 @@ function _M.init()
     _M.register("agent_mux_tokens_total",        "counter", "Total tokens, by direction and model.")
     _M.register("agent_mux_concurrent_sessions", "gauge",   "Currently-running agent sessions, by org.")
     _M.register("agent_mux_build_info",          "gauge",   "Build info (always 1).")
+    _M.register("agent_mux_redis_up",            "gauge",   "1 if last Redis PING succeeded, else 0.")
+    _M.register("agent_mux_fail_open_total",     "counter", "Times a Redis-backed policy fell back to allow due to Redis error, by component.")
     _M.register("agent_mux_llm_latency_seconds", "histogram",
         "Upstream LLM call latency in seconds, by model.")
     _M.register("agent_mux_tool_latency_seconds", "histogram",
@@ -119,8 +121,24 @@ local function render_histogram(name, key, h, buckets)
     return table.concat(out)
 end
 
+-- Probe Redis liveness inline with the scrape. Cheap (one PING) and
+-- piggybacks on whatever scrape interval the operator chose.
+local function probe_redis()
+    local ok_mod, redis_client = pcall(require, "agent_mux.redis_client")
+    if not ok_mod then return end
+    local r, err = redis_client.connect()
+    if not r then
+        _M.set("agent_mux_redis_up", {}, 0)
+        return
+    end
+    local res, perr = r:ping()
+    redis_client.release(r)
+    _M.set("agent_mux_redis_up", {}, (res and not perr) and 1 or 0)
+end
+
 function _M.write()
     ngx.header["Content-Type"] = "text/plain; version=0.0.4"
+    probe_redis()
     for name, entry in pairs(_registry) do
         ngx.print("# HELP ", name, " ", entry.help, "\n")
         ngx.print("# TYPE ", name, " ", entry.type, "\n")

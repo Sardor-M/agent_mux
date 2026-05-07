@@ -43,6 +43,8 @@ function _M.check()
     if not res then
         -- Fail-open. Same posture as every other Redis-backed policy.
         ngx.log(ngx.WARN, "ip_ratelimit script failed (fail-open): ", err)
+        require("agent_mux.observability.metrics")
+            .inc("agent_mux_fail_open_total", { component = "ip_ratelimit" })
         return true, 0, DEFAULT_CAPACITY
     end
 
