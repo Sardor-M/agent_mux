@@ -1,0 +1,276 @@
+name: Claude PR Review
+
+on:
+    pull_request:
+        types: [opened, synchronize]
+
+# Cancel any in-progress review for the same PR when a new push arrives.
+concurrency:
+    group: claude-review-${{ github.event.pull_request.number }}
+    cancel-in-progress: true
+
+jobs:
+    review:
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        permissions:
+            pull-requests: write
+            contents: read
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Get PR diff and related file context
+              id: diff
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  PR_NUM=${{ github.event.pull_request.number }}
+                  echo "PR number: $PR_NUM"
+
+                  # --- Raw diff ---
+                  RAW_DIFF=$(gh pr diff "$PR_NUM") || {
+                    echo "::error::gh pr diff failed with exit code $?"
+                    exit 1
+                  }
+
+                  RAW_LINES=$(echo "$RAW_DIFF" | wc -l | tr -d ' ')
+                  echo "Raw diff lines: $RAW_LINES"
+
+                  # Filter out non-code noise: bench output, logs, drawio diagrams,
+                  # nginx-runtime artefacts. Anything not in our actual source set.
+                  DIFF=$(echo "$RAW_DIFF" | grep -v -E '^diff --git.*(bench/run_|bench/baseline\.txt|logs/|run/|results/|__pycache__|\.drawio$|\.pyc$|\.DS_Store)' | head -n 8000)
+                  DIFF_LINES=$(echo "$DIFF" | wc -l | tr -d ' ')
+                  echo "Filtered diff lines: $DIFF_LINES"
+
+                  if [ -z "$RAW_DIFF" ]; then
+                    echo "::warning::gh pr diff returned empty output. Skipping review."
+                    echo "skip=true" >> "$GITHUB_OUTPUT"
+                    : > /tmp/pr_context.txt
+                    exit 0
+                  fi
+
+                  # --- Cost guard: skip very large diffs (Sonnet ~$0.10-0.20 per run) ---
+                  MAX_DIFF_LINES=4000
+                  if [ "$DIFF_LINES" -gt "$MAX_DIFF_LINES" ]; then
+                    echo "::warning::Diff too large ($DIFF_LINES lines > $MAX_DIFF_LINES). Skipping to stay within cost budget."
+                    echo "skip=true" >> "$GITHUB_OUTPUT"
+                    echo "skip_reason=diff_too_large" >> "$GITHUB_OUTPUT"
+                    : > /tmp/pr_context.txt
+                    exit 0
+                  fi
+
+                  echo "skip=false" >> "$GITHUB_OUTPUT"
+                  echo "diff_lines=$DIFF_LINES" >> "$GITHUB_OUTPUT"
+                  echo "$DIFF" > /tmp/pr_diff.txt
+
+                  # --- Related file context ---
+                  # AgentMux source set: Lua (most), Python (MCP demo), nginx config, shell, JSON config.
+                  CHANGED_FILES=$(gh pr view "$PR_NUM" --json files -q '.files[].path' \
+                    | grep -E '\.(lua|py|sh|conf|json|yml|yaml)$' \
+                    | grep -v -E '(bench/run_|bench/baseline\.txt|__pycache__|\.pyc$|results/)' \
+                    || true)
+                  echo "Changed code files:"
+                  echo "$CHANGED_FILES"
+
+                  : > /tmp/pr_context.txt
+                  # CHANGED files get a generous cap so the reviewer sees helpers + exports
+                  # at the bottom of the file (missing them produces false-positive bug reports).
+                  # RELATED files are only for cross-referencing types/signatures — 200 is plenty.
+                  MAX_TOTAL_LINES=4000
+                  CHANGED_MAX=600
+                  RELATED_MAX=200
+
+                  append_file() {
+                    local path="$1"
+                    local kind="$2"
+                    local limit="$3"
+                    [ ! -f "$path" ] && return 0
+                    local cur
+                    cur=$(wc -l < /tmp/pr_context.txt | tr -d ' ')
+                    if [ "$cur" -ge "$MAX_TOTAL_LINES" ]; then return 0; fi
+                    local total
+                    total=$(wc -l < "$path" | tr -d ' ')
+                    {
+                      printf '\n===== %s: %s =====\n' "$kind" "$path"
+                      head -n "$limit" "$path"
+                      if [ "$total" -gt "$limit" ]; then
+                        printf '\n... [TRUNCATED: %d more lines below — do not flag missing identifiers without checking the raw file] ...\n' "$((total - limit))"
+                      fi
+                    } >> /tmp/pr_context.txt
+                  }
+
+                  # Resolve a Lua require('agent_mux.foo.bar') or a Python import
+                  # to a relative file path. Returns 0 + the path on stdout if found,
+                  # 1 if external (stdlib, OpenResty bundle, third-party) or unresolvable.
+                  resolve_import() {
+                    local src="$1"
+                    local spec="$2"
+
+                    case "$src" in
+                      *.lua)
+                        # Lua module path: dots → slashes, look under lua/ for our modules.
+                        # Skip externals (cjson, ngx.*, resty.*, socket, dkjson, etc.).
+                        case "$spec" in
+                          cjson|cjson.*|ngx|ngx.*|resty.*|socket|socket.*|dkjson|cosmo|busted|busted.*|luassert|luassert.*|tests.*)
+                            return 1 ;;
+                        esac
+                        local path="lua/${spec//./\/}"
+                        for ext in .lua /init.lua; do
+                          [ -f "${path}${ext}" ] && { echo "${path}${ext}"; return 0; }
+                        done
+                        return 1
+                        ;;
+                      *.py)
+                        # Python import: search relative to the importing file, then project root.
+                        local path="${spec//./\/}"
+                        local dir
+                        dir=$(dirname "$src")
+                        for base in "$dir/$path" "$path"; do
+                          [ -f "${base}.py" ] && { echo "${base}.py"; return 0; }
+                          [ -f "${base}/__init__.py" ] && { echo "${base}/__init__.py"; return 0; }
+                        done
+                        return 1
+                        ;;
+                      *)
+                        return 1
+                        ;;
+                    esac
+                  }
+
+                  # Extract import specs from a file. One spec per line on stdout.
+                  extract_imports() {
+                    local f="$1"
+                    case "$f" in
+                      *.lua)
+                        # require("foo.bar") or require 'foo.bar'
+                        sed -nE "s/.*require\(?[\"']([^\"']+)[\"'].*/\1/p" "$f"
+                        ;;
+                      *.py)
+                        # `from X.Y import Z` and bare `import X.Y`
+                        sed -nE "s/^from ([a-zA-Z_][a-zA-Z0-9_.]*) import.*/\1/p" "$f"
+                        sed -nE "s/^import ([a-zA-Z_][a-zA-Z0-9_.]*).*/\1/p" "$f"
+                        ;;
+                    esac
+                  }
+
+                  declare -A SEEN
+                  while IFS= read -r f; do
+                    [ -z "$f" ] && continue
+                    SEEN["$f"]=1
+                    append_file "$f" "CHANGED" "$CHANGED_MAX"
+                  done <<< "$CHANGED_FILES"
+
+                  while IFS= read -r f; do
+                    [ -z "$f" ] && continue
+                    [ ! -f "$f" ] && continue
+                    IMPORTS=$(extract_imports "$f" | sort -u)
+                    while IFS= read -r spec; do
+                      [ -z "$spec" ] && continue
+                      resolved=$(resolve_import "$f" "$spec") || continue
+                      [ "${SEEN[$resolved]:-0}" = "1" ] && continue
+                      SEEN["$resolved"]=1
+                      append_file "$resolved" "RELATED" "$RELATED_MAX"
+                    done <<< "$IMPORTS"
+                  done <<< "$CHANGED_FILES"
+
+                  CTX_LINES=$(wc -l < /tmp/pr_context.txt | tr -d ' ')
+                  echo "Context lines: $CTX_LINES"
+                  echo "context_lines=$CTX_LINES" >> "$GITHUB_OUTPUT"
+
+            - name: Post skip notice
+              if: steps.diff.outputs.skip == 'true' && steps.diff.outputs.skip_reason == 'diff_too_large'
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  gh pr comment ${{ github.event.pull_request.number }} \
+                    --repo ${{ github.repository }} \
+                    --body "## 🤖 Claude Code Review
+
+                  Skipped — diff is too large for automated review (> 4000 lines). Use \`@claude\` in a comment to ask targeted questions about specific files or sections."
+
+            - name: Review with Claude
+              id: review
+              if: steps.diff.outputs.skip != 'true'
+              env:
+                  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+                  PR_TITLE: ${{ github.event.pull_request.title }}
+                  PR_BODY: ${{ github.event.pull_request.body }}
+              run: |
+                  PR_BODY_TRIMMED=$(echo "$PR_BODY" | head -c 2000)
+
+                  jq -n \
+                    --rawfile diff /tmp/pr_diff.txt \
+                    --rawfile context /tmp/pr_context.txt \
+                    --arg title "$PR_TITLE" \
+                    --arg body "$PR_BODY_TRIMMED" \
+                    '{
+                      model: "claude-sonnet-4-6",
+                      max_tokens: 1024,
+                      system: "Concise code reviewer for AgentMux — a Lua/OpenResty agent harness with a Python sidecar (MCP demo server). Languages: Lua 5.1 / LuaJIT (most code), Python 3.11+ (MCP demo + driftlock physics), nginx config, shell.\n\nFILE CONTEXT has post-change files — verify before flagging. Truncated files (marked [TRUNCATED]) may define identifiers you cannot see; do not flag them. Do not invent issues.\n\nLua patterns to watch for:\n- Missing `local` keyword (creates a process-wide global; the #1 footgun)\n- pcall around user-supplied code (handlers must never crash the worker)\n- ngx.* surface used outside an nginx phase (init_by_lua forbids cosockets)\n- Module-local state surviving across requests (intentional for caches, footgun for per-request data)\n- 1-indexed arrays (off-by-one when porting from Python)\n- {} is truthy (use `next(t) == nil` to test emptiness)\n\nCheck: bugs, security, type safety (where applicable), perf. Skip style.\n\nFormat — keep it SHORT:\n### Summary (2-3 sentences max)\n### Issues (only real bugs — each: severity critical/major/minor, file:line, one-line problem, one-line fix)\n### Nits (max 2, optional)\n\nIf clean, say so in one sentence. Total response under 400 words for small diffs (<200 lines), under 800 words for large diffs.",
+                      messages: [
+                        {
+                          role: "user",
+                          content: ("PR: " + $title + "\n\n" + $body + "\n\n# Diff\n```\n" + $diff + "\n```\n\n# File Context\n```\n" + $context + "\n```")
+                        }
+                      ]
+                    }' > /tmp/payload.json
+
+                  RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+                    -H "content-type: application/json" \
+                    -H "x-api-key: $ANTHROPIC_API_KEY" \
+                    -H "anthropic-version: 2023-06-01" \
+                    -d @/tmp/payload.json)
+
+                  echo "Stop reason: $(echo "$RESPONSE" | jq -r '.stop_reason // .error.message // "unknown"')"
+
+                  REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+
+                  if [ -z "$REVIEW" ]; then
+                    echo "::error::Claude API returned no review text"
+                    echo "$RESPONSE" | jq .
+                    exit 1
+                  fi
+
+                  echo "$REVIEW" > /tmp/review.txt
+
+                  IN_TOK=$(echo "$RESPONSE"  | jq -r '.usage.input_tokens // 0')
+                  OUT_TOK=$(echo "$RESPONSE" | jq -r '.usage.output_tokens // 0')
+                  CW_TOK=$(echo "$RESPONSE"  | jq -r '.usage.cache_creation_input_tokens // 0')
+                  CR_TOK=$(echo "$RESPONSE"  | jq -r '.usage.cache_read_input_tokens // 0')
+
+                  # Sonnet 4.6 pricing: input $3/MTok, output $15/MTok, cache write $3.75/MTok, cache read $0.30/MTok
+                  COST=$(awk -v i="$IN_TOK" -v o="$OUT_TOK" -v cw="$CW_TOK" -v cr="$CR_TOK" \
+                    'BEGIN { printf "%.6f", (i*3.0 + o*15.0 + cw*3.75 + cr*0.30) / 1000000 }')
+
+                  echo "Tokens: input=$IN_TOK output=$OUT_TOK cache_write=$CW_TOK cache_read=$CR_TOK"
+                  echo "Estimated cost: \$$COST USD"
+
+                  {
+                    echo "input_tokens=$IN_TOK"
+                    echo "output_tokens=$OUT_TOK"
+                    echo "cache_write_tokens=$CW_TOK"
+                    echo "cache_read_tokens=$CR_TOK"
+                    echo "cost_usd=$COST"
+                  } >> "$GITHUB_OUTPUT"
+
+            - name: Post review comment
+              if: steps.diff.outputs.skip != 'true'
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  {
+                    echo "## 🤖 Claude Code Review"
+                    echo ""
+                    cat /tmp/review.txt
+                    echo ""
+                    echo "---"
+                    echo "*Reviewed by claude-sonnet-4-6 · diff: ${{ steps.diff.outputs.diff_lines }} lines · context: ${{ steps.diff.outputs.context_lines }} lines · tokens: ${{ steps.review.outputs.input_tokens }} in / ${{ steps.review.outputs.output_tokens }} out · cost: \$${{ steps.review.outputs.cost_usd }} · tag \`@claude\` to ask follow-up questions*"
+                  } > /tmp/comment.txt
+
+                  gh pr comment ${{ github.event.pull_request.number }} \
+                    --repo ${{ github.repository }} \
+                    --body-file /tmp/comment.txt
