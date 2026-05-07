@@ -1,12 +1,12 @@
-# AgentMux
+# agent_mux
 
-> **AgentMux runs your MCP servers in production — with auth, budgets,
+> **agent_mux runs your MCP servers in production — with auth, budgets,
 > rate limits, lifecycle, and observability — so you don't have to.**
 
 Most teams adopting MCP end up rebuilding the same operational scaffolding:
 spawn the server, watch it crash, restart with backoff, route JSON-RPC, gate
 with auth, enforce per-tenant quotas, log every call, kill on budget breach.
-AgentMux is that scaffolding, shipped — a single OpenResty/LuaJIT process that
+agent_mux is that scaffolding, shipped — a single OpenResty/LuaJIT process that
 supervises a fleet of MCP servers and exposes them through one streaming agent
 endpoint.
 
@@ -97,7 +97,7 @@ lua/agent_mux/
   ├─ redis_client.lua          pooled cosocket client + script registry
   └─ errors.lua                shared error taxonomy
 examples/
-  ├─ tools/mcp_demo/           stdio MCP server in Python — supervised by AgentMux
+  ├─ tools/mcp_demo/           stdio MCP server in Python — supervised by agent_mux
   ├─ tools/mcp_servers.json    MCP manifest the supervisor reads
   ├─ tools/inline_calculator.lua, http_search/, http_tools.json
   └─ hooks/audit_log.lua       reference audit hook
@@ -131,7 +131,7 @@ make clean              # clear logs/ and run/
 
 Honest list of the gaps between what's shipped and full "MCP fleet manager"
 parity. None of these block the use cases above; they're the work that turns
-AgentMux into something an operations team can manage as a first-class
+agent_mux into something an operations team can manage as a first-class
 service:
 
 - **`GET /v1/mcp/servers`** — list supervised servers with restart count,
@@ -155,4 +155,4 @@ service:
 
 ## License
 
-TBD.
+MIT — see [`LICENSE`](LICENSE).
