@@ -1,0 +1,26 @@
+{
+    "hooks": {
+        "PreToolUse": [
+            {
+                "matcher": "Glob|Grep",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": ".claude/hooks/lumen-pretool.sh"
+                    }
+                ]
+            }
+        ],
+        "Stop": [
+            {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": ".claude/hooks/lumen-signal.sh"
+                    }
+                ]
+            }
+        ]
+    }
+}
