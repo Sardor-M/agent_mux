@@ -145,17 +145,18 @@ function _M.load(session_id)
     -- re-flush. If we're ahead (newer worker reading older worker's
     -- doc), that's fine; we just log it.
     if doc.schema_version and doc.schema_version < SCHEMA_VERSION then
-        local migrated, applied = pcall(migrations.apply, doc, SCHEMA_VERSION)
-        if not migrated then
+        -- pcall returns (ok, ...returns_of_apply); apply returns (doc, count).
+        local ok, new_doc, applied = pcall(migrations.apply, doc, SCHEMA_VERSION)
+        if not ok then
             log.error("session_migration_failed", {
                 session_id = session_id,
                 from       = doc.schema_version,
                 to         = SCHEMA_VERSION,
-                err        = tostring(applied),   -- pcall's err message
+                err        = tostring(new_doc),   -- on failure new_doc holds the error
             })
             return nil, "migration_failed"
         end
-        doc = migrated
+        doc = new_doc
         log.info("session_migrated", {
             session_id = session_id,
             applied    = applied,
