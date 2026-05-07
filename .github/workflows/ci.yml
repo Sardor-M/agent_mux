@@ -75,6 +75,10 @@ jobs:
           sudo add-apt-repository -y "deb http://openresty.org/package/ubuntu $(lsb_release -sc) main"
           sudo apt-get update
           sudo apt-get install -y openresty
+          # lua-resty-http is not bundled with OpenResty (resty.redis is,
+          # but resty.http is third-party). tools/http.lua and
+          # upstream/anthropic.lua require it at worker init.
+          sudo /usr/local/openresty/bin/opm get ledgetech/lua-resty-http
 
       - name: Boot OpenResty
         env:
