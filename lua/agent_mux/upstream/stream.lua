@@ -96,10 +96,12 @@ function _M:feed(chunk)
     return events
 end
 
--- Drain anything still in the buffer at end-of-stream.
+-- Drain anything still in the buffer at end-of-stream. We feed "\n\n":
+-- the first newline terminates a partial line still in `_buf`, the second
+-- is the SSE blank-line that flushes the in-progress event.
 function _M:close()
     local out = {}
-    for _, ev in ipairs(self:feed("\n")) do out[#out + 1] = ev end
+    for _, ev in ipairs(self:feed("\n\n")) do out[#out + 1] = ev end
     return out
 end
 
