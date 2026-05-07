@@ -59,14 +59,22 @@ function _M.init_worker()
             require("agent_mux.hooks.loader").load_dir(hooks_dir)
         end
 
-        -- Load Redis Lua scripts. We swallow Redis-down errors so a
-        -- temporarily-unavailable Redis doesn't block the worker from
-        -- starting; redis_client.run will return nil and our wrappers
-        -- fail-open.
-        local rc = require("agent_mux.redis_client")
-        local sok, serr = rc.load_scripts(redis_scripts())
-        if not sok then
-            ngx.log(ngx.WARN, "redis script load failed (will retry per-call): ", serr)
+        -- Load Redis Lua scripts. Cosockets are disabled in
+        -- init_worker_by_lua*, so defer the connect+SCRIPT LOAD via a
+        -- zero-delay timer where they are allowed. We swallow Redis-down
+        -- errors so a temporarily-unavailable Redis doesn't block the
+        -- worker from starting; redis_client.run returns nil and our
+        -- wrappers fail-open.
+        local rc           = require("agent_mux.redis_client")
+        local script_specs = redis_scripts()
+        local sched_ok, sched_err = ngx.timer.at(0, function()
+            local sok, serr = rc.load_scripts(script_specs)
+            if not sok then
+                ngx.log(ngx.WARN, "redis script load failed (will retry per-call): ", serr)
+            end
+        end)
+        if not sched_ok then
+            ngx.log(ngx.WARN, "could not schedule redis script load: ", sched_err)
         end
     end)
     if not ok then

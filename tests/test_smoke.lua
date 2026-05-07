@@ -58,7 +58,10 @@ describe("smoke", function()
         assert.is_function(store.create)
         assert.is_function(reg.register)
         reg._reset_for_test()
-        reg.register({ name = "noop", run = function() end })
+        reg.register({
+            name = "noop", description = "no-op", schema = {},
+            run = function() end,
+        })
         assert.is_table(reg.get("noop"))
     end)
 

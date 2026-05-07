@@ -27,7 +27,10 @@ local function make_session()
 end
 
 describe("tools.dispatcher", function()
-    before_each(function() registry._reset_for_test() end)
+    before_each(function()
+        helpers.install_ngx_stub()
+        registry._reset_for_test()
+    end)
 
     it("returns results in input order across concurrent threads", function()
         registry.register({

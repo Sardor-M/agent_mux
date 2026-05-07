@@ -6,6 +6,23 @@
 
 local M = {}
 
+-- The real lua-resty-redis / lua-resty-http modules touch ngx.socket.tcp
+-- at module load, which can't be satisfied under plain Lua. Production
+-- modules `require` them at the top of the file, so we preload no-op
+-- stand-ins. Tests monkey-patch around the actual network calls, so a
+-- stub that returns a chainable truthy is sufficient.
+local function fake_resty_module()
+    return {
+        new = function()
+            return setmetatable({}, {
+                __index = function() return function() return true end end,
+            })
+        end,
+    }
+end
+package.preload["resty.redis"] = fake_resty_module
+package.preload["resty.http"]  = fake_resty_module
+
 -- Minimal ngx surface used by the modules we ship. Add fields lazily as
 -- new tests need them.
 function M.install_ngx_stub()

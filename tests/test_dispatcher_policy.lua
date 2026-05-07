@@ -33,6 +33,7 @@ local original_try_consume = ratelimit.try_consume
 
 describe("dispatcher integration with policy", function()
     before_each(function()
+        helpers.install_ngx_stub()
         registry._reset_for_test()
         registry.register({
             name = "ok", description = ".", schema = {},

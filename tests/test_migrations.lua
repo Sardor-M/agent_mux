@@ -13,6 +13,7 @@ local redis      = require("agent_mux.redis_client")
 local store      = require("agent_mux.session.store")
 
 describe("session.migrations.apply", function()
+    before_each(function() helpers.install_ngx_stub() end)
     after_each(function() migrations._set_for_test({}) end)
 
     it("is a no-op when doc is already at target", function()
@@ -58,6 +59,7 @@ end)
 describe("session.store.load through migration path", function()
     local original_connect, original_release = redis.connect, redis.release
 
+    before_each(function() helpers.install_ngx_stub() end)
     after_each(function()
         migrations._set_for_test({})
         redis.connect = original_connect
@@ -106,5 +108,3 @@ describe("session.store.load through migration path", function()
         assert.equals("hi",              s.messages[1].content)
     end)
 end)
-
-helpers.uninstall_ngx_stub()

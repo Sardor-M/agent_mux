@@ -38,10 +38,14 @@ function _M.run(input, _ctx)
     end
 
     local source = "return (" .. input.expr .. ")"
-    local chunk, perr = load(source, "calc", "t", ALLOWED_ENV)
+    -- Use loadstring + setfenv so this works on both plain Lua 5.1 (CI)
+    -- and LuaJIT (production OpenResty). load(string, ...) requires the
+    -- 5.2-compat extension and isn't portable.
+    local chunk, perr = loadstring(source, "calc")
     if not chunk then
         return { is_error = true, content = "parse_error: " .. tostring(perr) }
     end
+    setfenv(chunk, ALLOWED_ENV)
 
     local ok, val = pcall(chunk)
     if not ok then
