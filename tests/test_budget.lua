@@ -16,6 +16,9 @@ end
 local original_run = redis.run
 
 describe("session.budget", function()
+    -- busted insulates describe blocks from file-top globals, so re-install
+    -- the ngx stub for each test even though we already called it above.
+    before_each(function() helpers.install_ngx_stub() end)
     after_each(function() redis.run = original_run end)
 
     it("passes through when no cap is configured", function()
