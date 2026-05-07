@@ -1,4 +1,4 @@
-# AgentMux
+# agent_mux
 
 A small, fast **agent harness** built on OpenResty/LuaJIT. It runs multi-turn
 LLM agent loops in a single nginx worker — streaming SSE to the client,
