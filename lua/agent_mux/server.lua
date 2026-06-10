@@ -164,6 +164,11 @@ end
 -- /v1/agents must apply here. Without this, anyone who can reach the port
 -- could read or cancel any session whose id they can guess.
 function _M.session_access()
+    local method = ngx.req.get_method()
+    if method ~= "GET" and method ~= "DELETE" then
+        return errors.respond(405, "method_not_allowed", method)
+    end
+
     local auth_ok, auth_reason = auth_req.check()
     if not auth_ok then
         return errors.respond(401, "unauthorized", auth_reason)
