@@ -32,6 +32,7 @@ local DEFAULT_URL = os.getenv("ANTHROPIC_URL") or "http://127.0.0.1:8080/mock/v1
 -- opts, so without this the real Anthropic API would always 401 — only the
 -- local mock (which ignores auth) would work. opts.api_key still overrides.
 local DEFAULT_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+if DEFAULT_API_KEY == "" then DEFAULT_API_KEY = nil end
 local API_VERSION = "2023-06-01"
 
 -- Build the JSON body the API expects. We deliberately pass through whatever
@@ -129,8 +130,8 @@ function _M.call(model, messages, tools, opts)
         ["Accept"]            = "text/event-stream",
         ["anthropic-version"] = API_VERSION,
     }
-    local api_key = opts.api_key or DEFAULT_API_KEY
-    if api_key then headers["x-api-key"] = api_key end
+    local api_key = (opts.api_key and opts.api_key ~= "") and opts.api_key or DEFAULT_API_KEY
+    if api_key and api_key ~= "" then headers["x-api-key"] = api_key end
 
     local res, rerr = httpc:request_uri(url, {
         method  = "POST",
