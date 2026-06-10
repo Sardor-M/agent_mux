@@ -103,12 +103,26 @@ function _M.bootstrap(config)
             end
         end
     end
+    -- NOTE: MCP is intentionally NOT bootstrapped here. Spawning MCP
+    -- subprocesses uses ngx.pipe read/write, which are cosocket-class APIs
+    -- disabled in init_worker_by_lua*. The caller must invoke bootstrap_mcp
+    -- from a phase where they're allowed (e.g. an ngx.timer.at(0) callback).
+end
+
+-- Bring up MCP servers. Split out from bootstrap() because ngx.pipe
+-- stdin_write/stdout_read_line are forbidden in init_worker_by_lua* — this
+-- must run from a timer (or request) phase. Errors in one manifest do not
+-- stop the others.
+function _M.bootstrap_mcp(config)
+    config = config or {}
     if config.mcp and config.mcp.manifests then
         local mcp = require("agent_mux.tools.mcp")
         for _, manifest_path in ipairs(config.mcp.manifests) do
-            local ok, err = pcall(mcp.load_manifest, manifest_path)
+            local ok, res, err = pcall(mcp.load_manifest, manifest_path)
             if not ok then
-                ngx.log(ngx.WARN, "mcp.load_manifest(", manifest_path, ") failed: ", err)
+                ngx.log(ngx.WARN, "mcp.load_manifest(", manifest_path, ") crashed: ", res)
+            elseif not res then
+                ngx.log(ngx.WARN, "mcp.load_manifest(", manifest_path, ") failed: ", tostring(err))
             end
         end
     end

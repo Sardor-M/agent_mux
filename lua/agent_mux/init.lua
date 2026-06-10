@@ -47,10 +47,11 @@ end
 -- point. We would rather fail to start than serve traffic with a half-
 -- initialised registry.
 function _M.init_worker()
+    local config = default_config()
     local ok, err = pcall(function()
         require("agent_mux.observability.metrics").init()
         require("agent_mux.policy.auth_request").init()
-        require("agent_mux.tools.registry").bootstrap(default_config())
+        require("agent_mux.tools.registry").bootstrap(config)
 
         -- Load hooks from the configured directory. AGENT_MUX_HOOKS_DIR
         -- can be empty / unset to disable hooks entirely.
@@ -72,9 +73,18 @@ function _M.init_worker()
             if not sok then
                 ngx.log(ngx.WARN, "redis script load failed (will retry per-call): ", serr)
             end
+
+            -- MCP bring-up also lives here: ngx.pipe stdin_write/stdout_read_line
+            -- are disabled in init_worker_by_lua* but allowed in a timer phase.
+            local mok, merr = pcall(function()
+                require("agent_mux.tools.registry").bootstrap_mcp(config)
+            end)
+            if not mok then
+                ngx.log(ngx.WARN, "mcp bootstrap failed: ", merr)
+            end
         end)
         if not sched_ok then
-            ngx.log(ngx.WARN, "could not schedule redis script load: ", sched_err)
+            ngx.log(ngx.WARN, "could not schedule redis script load / mcp bootstrap: ", sched_err)
         end
     end)
     if not ok then
