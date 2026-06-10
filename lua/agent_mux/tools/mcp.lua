@@ -36,7 +36,7 @@ local _M = {}
 -- many tools/call invocations.
 --
 -- Each entry shape:
---   { proc, info, spec, attempts, last_attempt_ms }
+--   { proc, info, spec, attempts, last_attempt_ms, alive, sem }
 local _servers = {}
 
 local DEFAULT_TIMEOUT_MS = 5000
@@ -195,15 +195,35 @@ local function make_tool_manifest(server, mcp_tool, prefix)
                 }
             end
 
-            local result, err = call_and_wait(entry.proc, req)
+            -- Re-fetch entry under the lock: the server may have been
+            -- respawned while we were waiting, giving us a fresh proc.
+            -- Also re-check liveness — if it died while we waited but no
+            -- respawn has run yet, fail fast rather than burning the timeout.
+            entry = _servers[server.name] or entry
+            if not is_alive(entry) then
+                entry.sem:post()
+                return {
+                    is_error = true,
+                    content  = "mcp_server_dead: " .. server.name
+                               .. " (died while waiting for lock)",
+                }
+            end
+
+            -- Wrap in pcall so sem:post() is guaranteed even if call_and_wait
+            -- raises an unexpected Lua error (nil-deref, library throw, etc.).
+            local call_ok, result, call_err = pcall(call_and_wait, entry.proc, req)
             entry.sem:post()
 
-            if not result then
+            if not call_ok then
+                -- result holds the error string thrown by the Lua runtime
+                entry.alive = false
+                return { is_error = true, content = "mcp_call_crashed: " .. tostring(result) }
+            elseif not result then
                 -- A write/read failure means the pipe is gone — flag the
                 -- server dead so the next call triggers a respawn instead of
                 -- failing forever against a corpse.
                 entry.alive = false
-                return { is_error = true, content = "mcp_call_failed: " .. tostring(err) }
+                return { is_error = true, content = "mcp_call_failed: " .. tostring(call_err) }
             end
 
             -- MCP returns { content = [{type="text", text="..."}], isError = bool }.
@@ -313,6 +333,15 @@ function respawn_if_due(server_name)
     entry.last_attempt_ms = now_ms
     ngx.log(ngx.WARN, "mcp_server_died: respawning ", server_name,
                       " (attempt ", entry.attempts, ")")
+
+    -- Kill the stale process before spawning a new one to prevent leaks.
+    -- The proc may still be running if it was wedged/unresponsive rather
+    -- than self-terminated; pcall guards against a kill() error on an
+    -- already-dead handle.
+    if entry.proc then
+        pcall(entry.proc.kill, entry.proc, 9)
+        entry.proc = nil
+    end
 
     local registered, err = bring_up(entry.spec)
     if not registered then
