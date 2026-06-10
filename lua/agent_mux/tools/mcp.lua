@@ -24,9 +24,10 @@
 --     ]
 --   }
 
-local cjson    = require("cjson.safe")
-local jsonrpc  = require("agent_mux.transport.jsonrpc")
-local registry = require("agent_mux.tools.registry")
+local cjson     = require("cjson.safe")
+local jsonrpc   = require("agent_mux.transport.jsonrpc")
+local registry  = require("agent_mux.tools.registry")
+local semaphore = require("ngx.semaphore")
 
 local _M = {}
 
@@ -40,21 +41,68 @@ local _servers = {}
 
 local DEFAULT_TIMEOUT_MS = 5000
 
+-- Forward declarations — these are referenced by closures defined earlier
+-- in the file than their `function` bodies. Without the `local` here, the
+-- earlier references would compile to *global* lookups (always nil) and the
+-- respawn path would crash with "attempt to call a nil value".
+local respawn_if_due
+local bring_up
+
 -- Exponential backoff on respawn — caps at 30s so a permanently broken
 -- server doesn't hammer the host but we keep retrying eventually.
 local function backoff_ms(attempts)
     return math.min(30000, (2 ^ math.min(attempts, 8)) * 100)
 end
 
--- Probe an MCP server's subprocess. Returns true if it's running and
--- usable, false if it has died or was never spawned.
+-- Probe an MCP server's subprocess. Returns true if it's believed running
+-- and usable, false if it has died or was never spawned.
+--
+-- We deliberately do NOT use proc:pid() for liveness: ngx.pipe's pid() is a
+-- static getter that returns the spawn-time pid forever — it does not become
+-- nil when the child exits. Death is instead surfaced as a write/read error
+-- on the pipe (or stderr EOF), at which point the call path / stderr drainer
+-- flips entry.alive = false. This flag is the source of truth.
 local function is_alive(entry)
     if not entry or not entry.proc then return false end
-    -- ngx.pipe procs expose `pid` while running; reading it returns nil
-    -- once the proc has exited or signaled.
-    local ok = pcall(function() return entry.proc:pid() end)
-    if not ok then return false end
-    return entry.proc:pid() ~= nil
+    return entry.alive ~= false
+end
+
+-- Continuously drain a server's stderr so its pipe buffer can never fill.
+-- A stdio MCP server that logs to stderr (the Python SDK does) would
+-- otherwise block in write() once the ~64KB kernel buffer fills and stop
+-- servicing stdin — a silent, unrecoverable wedge. We run this in a timer
+-- (cosocket phase) and log each line. stderr EOF ("closed") is also our
+-- cleanest death signal, so we flip entry.alive there.
+local function start_stderr_drainer(server_name, proc)
+    local ok, terr = ngx.timer.at(0, function(premature)
+        if premature then return end
+        while true do
+            if ngx.worker and ngx.worker.exiting and ngx.worker.exiting() then return end
+            local cur = _servers[server_name]
+            -- If the server was respawned, `proc` is stale — this drainer
+            -- belongs to the old process and should exit; the new process
+            -- has its own drainer.
+            if not cur or cur.proc ~= proc then return end
+
+            local line, rerr = proc:stderr_read_line()
+            if line then
+                ngx.log(ngx.INFO, "mcp[", server_name, "] stderr: ", line)
+            elseif rerr == "timeout" then
+                -- No output within the read timeout — loop and re-check
+                -- worker/respawn state.
+            else
+                -- "closed" / EOF / other error: the child's stderr is gone,
+                -- which means the process is gone. Mark dead and stop.
+                cur.alive = false
+                ngx.log(ngx.WARN, "mcp[", server_name,
+                    "] stderr closed (", tostring(rerr), ") — marking dead")
+                return
+            end
+        end
+    end)
+    if not ok then
+        ngx.log(ngx.WARN, "mcp[", server_name, "] could not start stderr drainer: ", terr)
+    end
 end
 
 -- Read newline-delimited JSON. Returns nil on EOF / timeout.
@@ -134,8 +182,27 @@ local function make_tool_manifest(server, mcp_tool, prefix)
                 arguments = input or {},
             })
 
+            -- Serialise pipe access: only one in-flight request per server,
+            -- so concurrent tool calls can't interleave on the shared stdio
+            -- pipe or steal each other's responses. Wait up to the tool's
+            -- timeout for the lock.
+            local timeout_s = (server.timeout_ms or DEFAULT_TIMEOUT_MS) / 1000
+            local lock_ok, lock_err = entry.sem:wait(timeout_s)
+            if not lock_ok then
+                return {
+                    is_error = true,
+                    content  = "mcp_busy: " .. server.name .. " — " .. tostring(lock_err),
+                }
+            end
+
             local result, err = call_and_wait(entry.proc, req)
+            entry.sem:post()
+
             if not result then
+                -- A write/read failure means the pipe is gone — flag the
+                -- server dead so the next call triggers a respawn instead of
+                -- failing forever against a corpse.
+                entry.alive = false
                 return { is_error = true, content = "mcp_call_failed: " .. tostring(err) }
             end
 
@@ -157,7 +224,7 @@ local function make_tool_manifest(server, mcp_tool, prefix)
 end
 
 -- Spawn one server, run initialize handshake + tools/list, register tools.
-local function bring_up(server)
+function bring_up(server)
     local ngx_pipe = require("ngx.pipe")
     local cmd = { server.command }
     for _, a in ipairs(server.args or {}) do cmd[#cmd + 1] = a end
@@ -194,15 +261,24 @@ local function bring_up(server)
     end
 
     -- Preserve attempt counter across respawns so backoff escalates;
--- reset on the first successful registration after respawn (in respawn()).
-local existing = _servers[server.name]
-_servers[server.name] = {
-    proc            = proc,
-    info            = init_res,
-    spec            = server,
-    attempts        = (existing and existing.attempts) or 0,
-    last_attempt_ms = ngx.now() * 1000,
-}
+    -- reset on the first successful registration after respawn (in respawn()).
+    -- The semaphore (1 resource) is the per-server pipe lock: it serialises
+    -- concurrent tools/call round-trips so two light threads can't interleave
+    -- writes/reads on the same stdio pipe. Preserved across respawns so a
+    -- waiter blocked during a respawn still holds a valid lock afterward.
+    local existing = _servers[server.name]
+    _servers[server.name] = {
+        proc            = proc,
+        info            = init_res,
+        spec            = server,
+        attempts        = (existing and existing.attempts) or 0,
+        last_attempt_ms = ngx.now() * 1000,
+        alive           = true,
+        sem             = (existing and existing.sem) or semaphore.new(1),
+    }
+
+    -- Start draining stderr so the child can't deadlock on a full pipe.
+    start_stderr_drainer(server.name, proc)
 
     -- 4. register every discovered tool
     local registered = {}
@@ -221,7 +297,7 @@ end
 
 -- Try to respawn a dead MCP server. Honours backoff so a perpetually
 -- broken process doesn't get hammered. Returns true on success.
-local function respawn_if_due(server_name)
+function respawn_if_due(server_name)
     local entry = _servers[server_name]
     if not entry then return false, "no spec for " .. server_name end
     if not entry.spec then return false, "no spec for " .. server_name end
