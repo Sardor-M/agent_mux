@@ -219,10 +219,13 @@ local function make_tool_manifest(server, mcp_tool, prefix)
                 entry.alive = false
                 return { is_error = true, content = "mcp_call_crashed: " .. tostring(result) }
             elseif not result then
-                -- A write/read failure means the pipe is gone — flag the
-                -- server dead so the next call triggers a respawn instead of
-                -- failing forever against a corpse.
-                entry.alive = false
+                -- Only pipe-level failures mean the server is gone.
+                -- JSON-RPC protocol errors (bad params, unknown method, etc.)
+                -- are valid responses from a healthy server and must NOT
+                -- trigger a respawn — only "write:" / "read:" prefixes do.
+                if call_err and (call_err:sub(1, 6) == "write:" or call_err:sub(1, 5) == "read:") then
+                    entry.alive = false
+                end
                 return { is_error = true, content = "mcp_call_failed: " .. tostring(call_err) }
             end
 
