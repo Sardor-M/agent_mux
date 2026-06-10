@@ -158,6 +158,25 @@ function _M.log_phase()
     end
 end
 
+-- Access guard for the session-introspection routes. Sessions hold the
+-- full message history (prompts, tool results — potentially PII) and can be
+-- cancelled, so the same API-key auth and per-IP rate limit that protect
+-- /v1/agents must apply here. Without this, anyone who can reach the port
+-- could read or cancel any session whose id they can guess.
+function _M.session_access()
+    local auth_ok, auth_reason = auth_req.check()
+    if not auth_ok then
+        return errors.respond(401, "unauthorized", auth_reason)
+    end
+
+    local ip_ok, retry_ms = ip_ratelimit.check()
+    if not ip_ok then
+        ngx.header["Retry-After"] = math.ceil(retry_ms / 1000)
+        return errors.respond(429, "ip_rate_limited",
+            ("retry after %d ms"):format(retry_ms))
+    end
+end
+
 -- /v1/sessions/:id  — non-streaming. GET introspects, DELETE cancels.
 function _M.handle_session()
     local session_id = ngx.var.session_id
