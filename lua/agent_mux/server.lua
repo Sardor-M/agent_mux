@@ -158,6 +158,124 @@ function _M.log_phase()
     end
 end
 
+-- POST /mcp  — northbound MCP gateway (Streamable-HTTP transport).
+--
+-- An MCP client (Claude Code, Codex) POSTs JSON-RPC here; we route each
+-- message through gateway.mcp_server and reply with a single JSON body.
+-- A batch (JSON array) is processed in order and answered with an array of
+-- the responses that have ids (notifications produce no response). API-key
+-- auth is applied at this edge exactly like /v1/agents.
+function _M.mcp_gateway()
+    if ngx.req.get_method() ~= "POST" then
+        return errors.respond(405, "method_not_allowed", ngx.req.get_method())
+    end
+
+    local auth_ok, auth_reason = auth_req.check()
+    if not auth_ok then
+        return errors.respond(401, "unauthorized", auth_reason)
+    end
+
+    ngx.req.read_body()
+    local raw = ngx.req.get_body_data()
+    if (not raw or raw == "") then
+        local bf = ngx.req.get_body_file()
+        if bf then
+            local fh = io.open(bf, "rb")
+            if fh then raw = fh:read("*a"); fh:close() end
+        end
+    end
+    if not raw or raw == "" then
+        return errors.respond(400, "bad_request", "empty body")
+    end
+
+    local decoded, derr = cjson.decode(raw)
+    if decoded == nil then
+        return errors.respond(400, "parse_error", tostring(derr))
+    end
+
+    local gateway = require("agent_mux.gateway.mcp_server")
+    -- Stable-ish session id so per-tool rate-limit buckets are shared across
+    -- a client's calls rather than reset every request.
+    local session = {
+        id = ngx.req.get_headers()["X-Session-Id"] or "mcp_gateway",
+        tool_policy = nil,
+    }
+
+    ngx.header["Content-Type"] = "application/json"
+
+    -- Batch vs single. A JSON-RPC batch is an array; decode of a JSON array
+    -- yields a Lua table with a [1] element (or an empty table for []).
+    if decoded[1] ~= nil then
+        local out = {}
+        for _, msg in ipairs(decoded) do
+            local resp = gateway.handle(msg, session)
+            if resp ~= nil then out[#out + 1] = resp end
+        end
+        if #out == 0 then
+            -- All notifications — HTTP 202, no JSON-RPC body.
+            ngx.status = 202
+            return ngx.exit(202)
+        end
+        ngx.say(cjson.encode(out))
+        return
+    end
+
+    local resp = gateway.handle(decoded, session)
+    if resp == nil then
+        -- Single notification — accepted, no body.
+        ngx.status = 202
+        return ngx.exit(202)
+    end
+    ngx.say(cjson.encode(resp))
+end
+
+-- Right-pad to a column width (always leaves at least one trailing space).
+local function pad(s, n)
+    s = tostring(s == nil and "-" or s)
+    if #s >= n then return s .. " " end
+    return s .. string.rep(" ", n - #s)
+end
+
+-- Render mcp.status() as a fixed-width text table for the CLI status view.
+local function mcp_status_text(status)
+    local lines = {}
+    lines[#lines + 1] = ("MCP SERVERS (%d)"):format(#status)
+    lines[#lines + 1] = pad("NAME", 16) .. pad("STATUS", 8) .. pad("PID", 8) ..
+        pad("RESTARTS", 10) .. pad("TOOLS", 7) .. pad("INFLIGHT", 10) ..
+        pad("CALLS", 8) .. pad("ERRORS", 8) .. "LAST(ms)"
+    if #status == 0 then
+        lines[#lines + 1] = "(no MCP servers configured — set AGENT_MUX_MCP_FILE)"
+    end
+    for _, s in ipairs(status) do
+        local state = s.alive and "up" or "DOWN"
+        local last  = s.last_latency_ms and string.format("%.1f", s.last_latency_ms) or "-"
+        lines[#lines + 1] = pad(s.name, 16) .. pad(state, 8) .. pad(s.pid or "-", 8) ..
+            pad(s.restarts, 10) .. pad(s.tool_count, 7) .. pad(s.in_flight, 10) ..
+            pad(s.calls_total, 8) .. pad(s.errors_total, 8) .. last
+    end
+    return table.concat(lines, "\n") .. "\n"
+end
+
+-- GET /v1/mcp/servers  — supervised MCP server status.
+-- Default: JSON. `?format=text`: a rendered table (so the CLI needs no jq).
+function _M.mcp_status()
+    if ngx.req.get_method() ~= "GET" then
+        return errors.respond(405, "method_not_allowed", ngx.req.get_method())
+    end
+    local mcp    = require("agent_mux.tools.mcp")
+    local status = mcp.status()
+    local args   = ngx.req.get_uri_args()
+
+    if args.format == "text" then
+        ngx.header["Content-Type"] = "text/plain; charset=utf-8"
+        ngx.print(mcp_status_text(status))
+        return
+    end
+
+    ngx.header["Content-Type"] = "application/json"
+    ngx.say(cjson.encode({ servers = status, count = #status }))
+end
+
 -- /v1/sessions/:id  — non-streaming. GET introspects, DELETE cancels.
 function _M.handle_session()
     local session_id = ngx.var.session_id

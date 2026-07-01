@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""agent-mux-mcp — stdio<->HTTP bridge to the agent_mux MCP gateway.
+
+Lets stdio-only MCP clients (some Codex configs, older Claude Code setups)
+talk to the agent_mux Streamable-HTTP `/mcp` endpoint. Reads newline-delimited
+JSON-RPC from stdin, forwards each message to the gateway, and writes each
+response to stdout. Notifications (no `id`) get no reply, matching MCP stdio.
+
+Wire it into a client as a stdio server:
+
+    { "mcpServers": { "mux": { "command": "/abs/path/bin/agent-mux-mcp" } } }
+
+Config via env:
+    AGENT_MUX_MCP_URL   gateway endpoint (default http://localhost:8080/mcp)
+    AGENT_MUX_API_KEY   sent as X-API-Key if set
+"""
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+URL = os.environ.get("AGENT_MUX_MCP_URL", "http://localhost:8080/mcp")
+API_KEY = os.environ.get("AGENT_MUX_API_KEY")
+
+
+def post(payload: bytes):
+    req = urllib.request.Request(URL, data=payload, method="POST")
+    req.add_header("Content-Type", "application/json")
+    if API_KEY:
+        req.add_header("X-API-Key", API_KEY)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except Exception as e:  # noqa: BLE001 — surface any transport failure upstream
+        return None, str(e).encode()
+
+
+def write_line(obj) -> None:
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def main() -> None:
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        status, body = post(line.encode())
+        msg_id = msg.get("id") if isinstance(msg, dict) else None
+
+        if status is None:
+            # Transport failure. Reply with a JSON-RPC error only if the
+            # client expects a response (i.e. this was a request, not a
+            # notification).
+            if msg_id is not None:
+                write_line({
+                    "jsonrpc": "2.0", "id": msg_id,
+                    "error": {"code": -32000,
+                              "message": "gateway unreachable: " + body.decode(errors="replace")},
+                })
+            continue
+
+        if status == 202 or not body:
+            # Notification accepted — nothing to write back.
+            continue
+
+        try:
+            write_line(json.loads(body))
+        except json.JSONDecodeError:
+            sys.stdout.write(body.decode(errors="replace"))
+            if not body.endswith(b"\n"):
+                sys.stdout.write("\n")
+            sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
