@@ -1,9 +1,14 @@
--- tools/mcp.lua  —  Model Context Protocol client (stdio transport).
+-- tools/mcp.lua  —  Model Context Protocol client (stdio transport) + supervisor.
 --
 -- Spawns each configured MCP server as a subprocess via `ngx.pipe`,
 -- performs the JSON-RPC 2.0 initialize handshake, calls `tools/list`
 -- to discover tools, and registers each one in the local registry with
 -- a `run` closure that sends `tools/call` over the pipe.
+--
+-- Supervision: a background `ngx.timer.every` sweep respawns any server
+-- whose subprocess has died, honouring exponential backoff. The tool-call
+-- path also lazily respawns a dead server on demand, so a crash is
+-- recovered either by the next sweep or the next call, whichever is first.
 --
 -- For week 3 v0.1 we support **stdio only** with newline-delimited JSON
 -- framing (the simpler MCP transport). The HTTP/SSE transport is a
@@ -35,10 +40,20 @@ local _M = {}
 -- many tools/call invocations.
 --
 -- Each entry shape:
---   { proc, info, spec, attempts, last_attempt_ms }
+--   { proc, info, spec, attempts, restarts, last_attempt_ms, last_spawn_ms,
+--     tools = {names...}, in_flight, calls_total, errors_total, last_latency_ms }
 local _servers = {}
+local _supervisor_started = false
 
-local DEFAULT_TIMEOUT_MS = 5000
+local DEFAULT_TIMEOUT_MS   = 5000
+local SUPERVISE_INTERVAL_S = 5     -- how often the supervisor sweeps for dead servers
+
+-- Forward declarations. `make_tool_manifest`'s run closure and the
+-- supervisor reference `respawn_if_due` / `bring_up` before their
+-- definitions; Lua binds upvalues lexically at definition time, so these
+-- MUST be declared as locals up here or the references resolve to nil
+-- globals. (That was the respawn bug: the closure called a nil global.)
+local bring_up, respawn_if_due, supervise
 
 -- Exponential backoff on respawn — caps at 30s so a permanently broken
 -- server doesn't hammer the host but we keep retrying eventually.
@@ -52,9 +67,9 @@ local function is_alive(entry)
     if not entry or not entry.proc then return false end
     -- ngx.pipe procs expose `pid` while running; reading it returns nil
     -- once the proc has exited or signaled.
-    local ok = pcall(function() return entry.proc:pid() end)
+    local ok, pid = pcall(function() return entry.proc:pid() end)
     if not ok then return false end
-    return entry.proc:pid() ~= nil
+    return pid ~= nil
 end
 
 -- Read newline-delimited JSON. Returns nil on EOF / timeout.
@@ -134,8 +149,15 @@ local function make_tool_manifest(server, mcp_tool, prefix)
                 arguments = input or {},
             })
 
+            entry.in_flight = (entry.in_flight or 0) + 1
+            local t0 = ngx.now() * 1000
             local result, err = call_and_wait(entry.proc, req)
+            entry.in_flight = math.max(0, (entry.in_flight or 1) - 1)
+            entry.last_latency_ms = ngx.now() * 1000 - t0
+            entry.calls_total = (entry.calls_total or 0) + 1
+
             if not result then
+                entry.errors_total = (entry.errors_total or 0) + 1
                 return { is_error = true, content = "mcp_call_failed: " .. tostring(err) }
             end
 
@@ -148,6 +170,10 @@ local function make_tool_manifest(server, mcp_tool, prefix)
                 end
             end
 
+            if result.isError then
+                entry.errors_total = (entry.errors_total or 0) + 1
+            end
+
             return {
                 content  = table.concat(pieces, "\n"),
                 is_error = result.isError and true or nil,
@@ -157,7 +183,9 @@ local function make_tool_manifest(server, mcp_tool, prefix)
 end
 
 -- Spawn one server, run initialize handshake + tools/list, register tools.
-local function bring_up(server)
+-- Assigns to the forward-declared local (no `local` keyword) so the
+-- closures above capture the real function.
+function bring_up(server)
     local ngx_pipe = require("ngx.pipe")
     local cmd = { server.command }
     for _, a in ipairs(server.args or {}) do cmd[#cmd + 1] = a end
@@ -193,16 +221,25 @@ local function bring_up(server)
         return nil, "tools/list: " .. tostring(lerr)
     end
 
-    -- Preserve attempt counter across respawns so backoff escalates;
--- reset on the first successful registration after respawn (in respawn()).
-local existing = _servers[server.name]
-_servers[server.name] = {
-    proc            = proc,
-    info            = init_res,
-    spec            = server,
-    attempts        = (existing and existing.attempts) or 0,
-    last_attempt_ms = ngx.now() * 1000,
-}
+    -- Preserve counters across respawns so backoff escalates and status
+    -- totals survive a crash; reset attempts on the first successful
+    -- registration after respawn (in respawn_if_due).
+    local existing = _servers[server.name]
+    local now_ms   = ngx.now() * 1000
+    _servers[server.name] = {
+        proc            = proc,
+        info            = init_res,
+        spec            = server,
+        attempts        = (existing and existing.attempts) or 0,
+        restarts        = (existing and existing.restarts) or 0,
+        last_attempt_ms = now_ms,
+        last_spawn_ms   = now_ms,
+        tools           = {},
+        in_flight       = (existing and existing.in_flight) or 0,
+        calls_total     = (existing and existing.calls_total) or 0,
+        errors_total    = (existing and existing.errors_total) or 0,
+        last_latency_ms = existing and existing.last_latency_ms,
+    }
 
     -- 4. register every discovered tool
     local registered = {}
@@ -215,13 +252,14 @@ _servers[server.name] = {
             ngx.log(ngx.WARN, "mcp register failed for ", manifest.name, ": ", rerr)
         end
     end
+    _servers[server.name].tools = registered
 
     return registered
 end
 
 -- Try to respawn a dead MCP server. Honours backoff so a perpetually
 -- broken process doesn't get hammered. Returns true on success.
-local function respawn_if_due(server_name)
+function respawn_if_due(server_name)
     local entry = _servers[server_name]
     if not entry then return false, "no spec for " .. server_name end
     if not entry.spec then return false, "no spec for " .. server_name end
@@ -244,17 +282,56 @@ local function respawn_if_due(server_name)
         return false, err
     end
 
-    -- Success — reset attempt counter so the next failure starts at full
-    -- backoff window again rather than pinning at the cap.
-    if _servers[server_name] then
-        _servers[server_name].attempts = 0
+    -- Success — bump the cumulative restart counter and reset attempts so
+    -- the next failure starts at full backoff window again rather than
+    -- pinning at the cap.
+    local live = _servers[server_name]
+    if live then
+        live.attempts = 0
+        live.restarts = (live.restarts or 0) + 1
     end
     ngx.log(ngx.INFO, "mcp_server_respawned: ", server_name,
                       " (", #registered, " tools re-registered)")
     return true
 end
 
--- Read and validate the config file, then bring up every server.
+-- Background sweep: respawn any server whose subprocess has died. Runs on
+-- a timer so recovery does not depend on a tool call arriving. Backoff is
+-- enforced inside respawn_if_due, so a broken server is retried at most
+-- once per its current backoff window.
+function supervise()
+    for name, entry in pairs(_servers) do
+        if entry.spec and not is_alive(entry) then
+            respawn_if_due(name)
+        end
+    end
+end
+
+-- Arm the supervisor timer once per worker. `ngx.timer.every` is available
+-- from init_worker onward; if timers are unavailable (unit tests) we no-op
+-- and rely on lazy tool-call respawn.
+local function start_supervisor()
+    if _supervisor_started then return end
+    if not (ngx and ngx.timer and ngx.timer.every) then return end
+    local ok, err = ngx.timer.every(SUPERVISE_INTERVAL_S, function(premature)
+        if premature then return end
+        local sok, serr = pcall(supervise)
+        if not sok then ngx.log(ngx.WARN, "mcp supervise sweep failed: ", serr) end
+    end)
+    if ok then
+        _supervisor_started = true
+        ngx.log(ngx.INFO, "mcp supervisor armed (every ", SUPERVISE_INTERVAL_S, "s)")
+    else
+        ngx.log(ngx.WARN, "mcp supervisor timer failed to start: ", err)
+    end
+end
+
+-- Read and validate the config file, seed every server spec, and schedule
+-- bring-up. Cosocket / ngx.pipe I/O is NOT permitted in the init_worker
+-- phase (init.lua defers Redis SCRIPT LOAD for the same reason), so the
+-- actual spawn is deferred to a zero-delay timer where it is allowed. We
+-- seed specs synchronously first so the supervisor can retry any server
+-- whose initial bring-up fails.
 function _M.load_manifest(path)
     local f, ferr = io.open(path, "rb")
     if not f then return nil, "read " .. path .. ": " .. tostring(ferr) end
@@ -268,32 +345,93 @@ function _M.load_manifest(path)
         return nil, "manifest missing 'servers' array"
     end
 
-    local all_registered = {}
+    local specs = {}
     for _, server in ipairs(servers) do
         if not server.name or not server.command then
             ngx.log(ngx.WARN, "mcp server entry missing name/command — skipped")
         else
-            local registered, err = bring_up(server)
-            if not registered then
-                ngx.log(ngx.WARN, "mcp server '", server.name, "' bring-up failed: ", err)
-            else
-                for _, n in ipairs(registered) do
-                    all_registered[#all_registered + 1] = n
-                end
-            end
+            local existing = _servers[server.name]
+            _servers[server.name] = existing or {
+                attempts = 0, restarts = 0, last_attempt_ms = 0,
+                in_flight = 0, calls_total = 0, errors_total = 0, tools = {},
+            }
+            _servers[server.name].spec = server
+            specs[#specs + 1] = server
         end
     end
-    return all_registered
+
+    local function bring_up_all(premature)
+        if premature then return end
+        for _, server in ipairs(specs) do
+            local ok, registered, berr = pcall(bring_up, server)
+            if not ok then
+                ngx.log(ngx.WARN, "mcp bring-up crashed for ", server.name, ": ", tostring(registered))
+            elseif not registered then
+                ngx.log(ngx.WARN, "mcp bring-up failed for ", server.name, ": ", tostring(berr))
+            end
+        end
+        start_supervisor()
+    end
+
+    if ngx and ngx.timer and ngx.timer.at then
+        local sched_ok, sched_err = ngx.timer.at(0, bring_up_all)
+        if not sched_ok then
+            ngx.log(ngx.WARN, "mcp bring-up timer failed to schedule: ", sched_err)
+            bring_up_all(false)
+        end
+    else
+        -- No timer facility (unit tests): bring up synchronously.
+        bring_up_all(false)
+    end
+
+    -- Tools register asynchronously; return the seeded server names.
+    local names = {}
+    for _, s in ipairs(specs) do names[#names + 1] = s.name end
+    return names
+end
+
+-- Point-in-time status of every supervised server. Consumed by the
+-- GET /v1/mcp/servers endpoint and the CLI status view.
+function _M.status()
+    local out = {}
+    for name, e in pairs(_servers) do
+        local pid
+        if e.proc then
+            local ok, p = pcall(function() return e.proc:pid() end)
+            if ok then pid = p end
+        end
+        out[#out + 1] = {
+            name            = name,
+            alive           = is_alive(e),
+            pid             = pid,
+            command         = e.spec and e.spec.command,
+            restarts        = e.restarts or 0,
+            attempts        = e.attempts or 0,
+            tools           = e.tools or {},
+            tool_count      = e.tools and #e.tools or 0,
+            in_flight       = e.in_flight or 0,
+            calls_total     = e.calls_total or 0,
+            errors_total    = e.errors_total or 0,
+            last_latency_ms = e.last_latency_ms,
+        }
+    end
+    table.sort(out, function(a, b) return a.name < b.name end)
+    return out
 end
 
 -- Test / introspection helpers.
-_M._servers = function() return _servers end
+_M._servers            = function() return _servers end
+_M._backoff_ms         = backoff_ms
+_M._is_alive           = is_alive
+_M._make_tool_manifest = make_tool_manifest
+_M._supervise          = function() return supervise() end
 
 function _M._reset_for_test()
     for _, e in pairs(_servers) do
-        if e.proc then e.proc:shutdown("stdin") end
+        if e.proc then pcall(function() e.proc:shutdown("stdin") end) end
     end
     _servers = {}
+    _supervisor_started = false
 end
 
 return _M

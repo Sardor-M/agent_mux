@@ -76,6 +76,16 @@ function M.install_ngx_stub()
             get_body_data = function() return "" end,
         },
 
+        -- Non-executing ngx.timer stub. Real timers fire deferred work
+        -- (MCP bring-up, supervisor sweeps) in a phase where cosockets are
+        -- allowed; under busted we just record that scheduling succeeded so
+        -- module code takes the "timer available" branch without spawning
+        -- subprocesses. Tests drive the deferred functions directly.
+        timer    = {
+            at    = function() return true end,
+            every = function() return true end,
+        },
+
         -- Synchronous stand-in for ngx.thread so the dispatcher's
         -- concurrent path is exercised without OpenResty. We capture the
         -- function + args at spawn time and run them on wait.
