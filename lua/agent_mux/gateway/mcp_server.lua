@@ -59,6 +59,9 @@ end
 -- Dispatch one MCP tools/call. Returns (mcp_result | nil, code, message).
 local function tools_call(params, session)
     params = params or {}
+    if type(params) ~= "table" then
+        return nil, jsonrpc.INVALID_PARAMS, "params must be an object"
+    end
     local name = params.name
     if type(name) ~= "string" or name == "" then
         return nil, jsonrpc.INVALID_PARAMS, "params.name (string) required"

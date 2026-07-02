@@ -220,9 +220,10 @@ function _M.mcp_gateway()
     ngx.header["Content-Type"] = "application/json"
 
     -- Batch vs single. A JSON-RPC batch is an array; a non-empty array has a
-    -- [1] element. An empty array [] decodes to {} (#decoded == 0) with no
-    -- integer keys — treat it as a batch that yields no responses (HTTP 202).
-    if decoded[1] ~= nil or #decoded == 0 then
+    -- [1] element. An empty array [] decodes to a table with no keys at all
+    -- (next(decoded) == nil). Using #decoded == 0 would misfire on any JSON
+    -- object since Lua's # only counts integer-keyed sequence elements.
+    if decoded[1] ~= nil or next(decoded) == nil then
         local out = {}
         for _, msg in ipairs(decoded) do
             local resp = gateway.handle(msg, session)
