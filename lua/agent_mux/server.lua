@@ -206,9 +206,11 @@ function _M.mcp_gateway()
     -- Stable-ish session id so per-tool rate-limit buckets are shared across
     -- a client's calls rather than reset every request. Validate the header
     -- value so malformed ids don't propagate into Redis keys or logs.
-    local session_id = ngx.req.get_headers()["X-Session-Id"] or "mcp_gateway"
-    if not session_id:match("^[A-Za-z0-9_-]+$") or #session_id > 128 then
-        session_id = "mcp_gateway"
+    -- Fall back to a per-IP id so anonymous clients don't all share one bucket.
+    local session_id = ngx.req.get_headers()["X-Session-Id"]
+    if not session_id or not session_id:match("^[A-Za-z0-9_-]+$") or #session_id > 128 then
+        local ip = ngx.var.remote_addr or "unknown"
+        session_id = "mcp-" .. ip:gsub("[^A-Za-z0-9]", "-")
     end
     local session = {
         id          = session_id,
@@ -277,6 +279,12 @@ function _M.mcp_status()
     if ngx.req.get_method() ~= "GET" then
         return errors.respond(405, "method_not_allowed", ngx.req.get_method())
     end
+
+    local auth_ok, auth_reason = auth_req.check()
+    if not auth_ok then
+        return errors.respond(401, "unauthorized", auth_reason)
+    end
+
     local mcp    = require("agent_mux.tools.mcp")
     local status = mcp.status()
     local args   = ngx.req.get_uri_args()
