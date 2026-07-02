@@ -175,6 +175,12 @@ function _M.mcp_gateway()
         return errors.respond(401, "unauthorized", auth_reason)
     end
 
+    local cl = tonumber(ngx.req.get_headers()["Content-Length"])
+    if cl and cl > MAX_BODY_BYTES then
+        return errors.respond(413, "request_too_large",
+            string.format("body %d bytes exceeds %d byte cap", cl, MAX_BODY_BYTES))
+    end
+
     ngx.req.read_body()
     local raw = ngx.req.get_body_data()
     if (not raw or raw == "") then
@@ -192,20 +198,29 @@ function _M.mcp_gateway()
     if decoded == nil then
         return errors.respond(400, "parse_error", tostring(derr))
     end
+    if type(decoded) ~= "table" then
+        return errors.respond(400, "bad_request", "JSON-RPC request must be an object or array")
+    end
 
     local gateway = require("agent_mux.gateway.mcp_server")
     -- Stable-ish session id so per-tool rate-limit buckets are shared across
-    -- a client's calls rather than reset every request.
+    -- a client's calls rather than reset every request. Validate the header
+    -- value so malformed ids don't propagate into Redis keys or logs.
+    local session_id = ngx.req.get_headers()["X-Session-Id"] or "mcp_gateway"
+    if not session_id:match("^[A-Za-z0-9_-]+$") or #session_id > 128 then
+        session_id = "mcp_gateway"
+    end
     local session = {
-        id = ngx.req.get_headers()["X-Session-Id"] or "mcp_gateway",
+        id          = session_id,
         tool_policy = nil,
     }
 
     ngx.header["Content-Type"] = "application/json"
 
-    -- Batch vs single. A JSON-RPC batch is an array; decode of a JSON array
-    -- yields a Lua table with a [1] element (or an empty table for []).
-    if decoded[1] ~= nil then
+    -- Batch vs single. A JSON-RPC batch is an array; a non-empty array has a
+    -- [1] element. An empty array [] decodes to {} (#decoded == 0) with no
+    -- integer keys — treat it as a batch that yields no responses (HTTP 202).
+    if decoded[1] ~= nil or #decoded == 0 then
         local out = {}
         for _, msg in ipairs(decoded) do
             local resp = gateway.handle(msg, session)

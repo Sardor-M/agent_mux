@@ -59,12 +59,22 @@ def main() -> None:
         if status is None:
             # Transport failure. Reply with a JSON-RPC error only if the
             # client expects a response (i.e. this was a request, not a
-            # notification).
-            if msg_id is not None:
+            # notification). For batch requests, return an error per item
+            # that has an id.
+            err_msg = "gateway unreachable: " + body.decode(errors="replace")
+            if isinstance(msg, list):
+                errs = [
+                    {"jsonrpc": "2.0", "id": m.get("id"),
+                     "error": {"code": -32000, "message": err_msg}}
+                    for m in msg
+                    if isinstance(m, dict) and m.get("id") is not None
+                ]
+                if errs:
+                    write_line(errs)
+            elif msg_id is not None:
                 write_line({
                     "jsonrpc": "2.0", "id": msg_id,
-                    "error": {"code": -32000,
-                              "message": "gateway unreachable: " + body.decode(errors="replace")},
+                    "error": {"code": -32000, "message": err_msg},
                 })
             continue
 
@@ -72,13 +82,12 @@ def main() -> None:
             # Notification accepted — nothing to write back.
             continue
 
-        try:
-            write_line(json.loads(body))
-        except json.JSONDecodeError:
-            sys.stdout.write(body.decode(errors="replace"))
-            if not body.endswith(b"\n"):
-                sys.stdout.write("\n")
-            sys.stdout.flush()
+        # Write the gateway response directly — it is already valid JSON.
+        body_str = body.decode("utf-8", errors="replace")
+        sys.stdout.write(body_str)
+        if not body_str.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":

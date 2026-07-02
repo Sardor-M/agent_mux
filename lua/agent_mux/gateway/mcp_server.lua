@@ -34,10 +34,12 @@ local PROTOCOL_VERSION = "2024-11-05"
 local NULL_SSE = { emit = function() end }
 
 -- Monotonic synthetic tool_use ids so rate-limit / audit keys are unique.
+-- Include the worker id so parallel workers don't produce colliding keys.
 local _gen = 0
 local function gen_id()
     _gen = _gen + 1
-    return "mcpgw-" .. _gen
+    local wid = ngx.worker and ngx.worker.id and ngx.worker.id() or 0
+    return "mcpgw-" .. wid .. "-" .. _gen
 end
 
 -- Project the registry into MCP `tools/list` shape. Note the field rename:
@@ -63,7 +65,13 @@ local function tools_call(params, session)
     end
 
     local use = { id = gen_id(), name = name, input = params.arguments or {} }
-    local out = dispatcher.run_single(session, use, NULL_SSE)
+    local ok, out = pcall(dispatcher.run_single, session, use, NULL_SSE)
+    if not ok then
+        return {
+            content = { { type = "text", text = "internal_error: " .. tostring(out) } },
+            isError = true,
+        }
+    end
 
     -- dispatcher result → MCP content block. is_error maps to isError so the
     -- calling model sees tool failures (rate limits, denials, handler errors)
@@ -79,6 +87,7 @@ end
 --   returns nil for a notification (no reply on the wire).
 -- `session` is a minimal policy carrier: { id = "...", tool_policy = ... }.
 function _M.handle(msg, session)
+    session = session or { id = "mcp_gateway" }
     if type(msg) ~= "table" or msg.method == nil then
         -- Not a request/notification (e.g. a stray response). Ignore.
         return nil
@@ -103,6 +112,8 @@ function _M.handle(msg, session)
         })
 
     elseif method == "ping" then
+        metrics.inc("agent_mux_mcp_gateway_requests_total",
+            { method = method, outcome = "ok" })
         return jsonrpc.success_response(msg.id, {})
 
     elseif method == "tools/list" then
