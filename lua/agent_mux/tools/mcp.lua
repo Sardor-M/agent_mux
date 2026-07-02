@@ -180,6 +180,8 @@ local function make_tool_manifest(server, mcp_tool, prefix)
             if not is_alive(entry) then
                 local ok, rerr = respawn_if_due(server.name)
                 if not ok then
+                    entry.calls_total  = (entry.calls_total  or 0) + 1
+                    entry.errors_total = (entry.errors_total or 0) + 1
                     return {
                         is_error = true,
                         content  = "mcp_server_dead: " .. server.name .. " — " .. tostring(rerr),
@@ -324,7 +326,7 @@ function bring_up(server)
         sem             = (existing and existing.sem) or semaphore.new(1),
         restarts        = (existing and existing.restarts) or 0,
         tools           = {},
-        in_flight       = (existing and existing.in_flight) or 0,
+        in_flight       = 0,
         calls_total     = (existing and existing.calls_total) or 0,
         errors_total    = (existing and existing.errors_total) or 0,
         last_latency_ms = existing and existing.last_latency_ms,
@@ -355,6 +357,7 @@ function respawn_if_due(server_name)
     local entry = _servers[server_name]
     if not entry then return false, "no spec for " .. server_name end
     if not entry.spec then return false, "no spec for " .. server_name end
+    if is_alive(entry) then return true end
 
     local now_ms      = ngx.now() * 1000
     local since_last  = now_ms - (entry.last_attempt_ms or 0)
