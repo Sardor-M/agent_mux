@@ -452,6 +452,25 @@ function _M.load_manifest(path)
         if not server.name or not server.command then
             ngx.log(ngx.WARN, "mcp server entry missing name/command — skipped")
         else
+            -- Pre-seed a dead stub so the supervisor has a spec to retry even
+            -- if bring_up fails on the first attempt. bring_up replaces this
+            -- entry on success; on failure it remains with alive=false.
+            if not _servers[server.name] then
+                _servers[server.name] = {
+                    spec            = server,
+                    alive           = false,
+                    attempts        = 0,
+                    last_attempt_ms = 0,
+                    sem             = semaphore.new(1),
+                    restarts        = 0,
+                    tools           = {},
+                    in_flight       = 0,
+                    calls_total     = 0,
+                    errors_total    = 0,
+                }
+            else
+                _servers[server.name].spec = server
+            end
             local registered, err = bring_up(server)
             if not registered then
                 ngx.log(ngx.WARN, "mcp server '", server.name, "' bring-up failed: ", err)
