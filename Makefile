@@ -5,7 +5,8 @@ REDIS      := redis-server
 
 .DEFAULT_GOAL := help
 
-.PHONY: help check-deps dev stop demo test fmt clean dirs status watch
+.PHONY: help check-deps dev stop demo test fmt clean dirs status watch \
+        up down restart logs service-install service-uninstall
 
 help:                  ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -24,6 +25,24 @@ stop:                  ## Stop a backgrounded OpenResty if any
 
 demo: check-deps dirs  ## Boot redis + OpenResty for a local demo
 	@bash scripts/start_demo.sh
+
+up: check-deps dirs    ## Start agent_mux in the background (daemonized redis + OpenResty)
+	@bash scripts/agentmux.sh start
+
+down:                  ## Stop the background agent_mux service (graceful)
+	@bash scripts/agentmux.sh stop
+
+restart:               ## Restart the background service
+	@bash scripts/agentmux.sh restart
+
+logs:                  ## Tail the running service log
+	@bash scripts/agentmux.sh logs
+
+service-install:       ## Auto-start agent_mux at login + restart on crash (macOS launchd)
+	@bash scripts/install-service.sh install
+
+service-uninstall:     ## Remove the launchd auto-start agent
+	@bash scripts/install-service.sh uninstall
 
 test:                  ## Run busted unit tests
 	@command -v busted >/dev/null || { echo "busted not found — luarocks install busted"; exit 1; }

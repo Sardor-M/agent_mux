@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for agent_mux. Rendered + installed by scripts/install-service.sh
+  (make service-install), which substitutes __REPO__ and __PATH__. Do not edit
+  the installed copy in ~/Library/LaunchAgents directly — re-run the installer.
+
+  RunAtLoad + KeepAlive make the gateway start at login and respawn on crash.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentmux.gateway</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO__/scripts/agentmux.sh</string>
+        <string>foreground</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- launchd starts with a minimal PATH; inherit the installer's so
+             openresty / redis-server (e.g. Homebrew) are found. -->
+        <key>PATH</key>
+        <string>__PATH__</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__REPO__/logs/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__REPO__/logs/launchd.err.log</string>
+</dict>
+</plist>
