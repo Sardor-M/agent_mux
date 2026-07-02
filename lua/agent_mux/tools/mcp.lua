@@ -1,9 +1,14 @@
--- tools/mcp.lua  —  Model Context Protocol client (stdio transport).
+-- tools/mcp.lua  —  Model Context Protocol client (stdio transport) + supervisor.
 --
 -- Spawns each configured MCP server as a subprocess via `ngx.pipe`,
 -- performs the JSON-RPC 2.0 initialize handshake, calls `tools/list`
 -- to discover tools, and registers each one in the local registry with
 -- a `run` closure that sends `tools/call` over the pipe.
+--
+-- Recovery is driven two ways: a background sweep (`ngx.timer.every`)
+-- respawns dead servers proactively, and the tool-call path respawns lazily
+-- on demand — whichever happens first. Death is surfaced by pipe/stderr
+-- errors flipping `entry.alive`, not by polling pid.
 --
 -- For week 3 v0.1 we support **stdio only** with newline-delimited JSON
 -- framing (the simpler MCP transport). The HTTP/SSE transport is a
@@ -36,10 +41,13 @@ local _M = {}
 -- many tools/call invocations.
 --
 -- Each entry shape:
---   { proc, info, spec, attempts, last_attempt_ms, alive, sem }
+--   { proc, info, spec, attempts, last_attempt_ms, alive, sem,
+--     restarts, tools, in_flight, calls_total, errors_total, last_latency_ms }
 local _servers = {}
+local _supervisor_started = false
 
-local DEFAULT_TIMEOUT_MS = 5000
+local DEFAULT_TIMEOUT_MS   = 5000
+local SUPERVISE_INTERVAL_S = 5     -- how often the supervisor sweeps for dead servers
 
 -- Forward declarations — these are referenced by closures defined earlier
 -- in the file than their `function` bodies. Without the `local` here, the
@@ -47,9 +55,12 @@ local DEFAULT_TIMEOUT_MS = 5000
 -- respawn path would crash with "attempt to call a nil value".
 local respawn_if_due
 local bring_up
+local supervise
 
--- Exponential backoff on respawn — caps at 30s so a permanently broken
--- server doesn't hammer the host but we keep retrying eventually.
+-- Exponential backoff on respawn — the exponent is clamped at 8, so the
+-- effective ceiling is 2^8 * 100 = 25600ms; the outer min(30000, …) never
+-- binds. Keeps a permanently broken server from hammering the host while
+-- still retrying eventually.
 local function backoff_ms(attempts)
     return math.min(30000, (2 ^ math.min(attempts, 8)) * 100)
 end
@@ -169,6 +180,8 @@ local function make_tool_manifest(server, mcp_tool, prefix)
             if not is_alive(entry) then
                 local ok, rerr = respawn_if_due(server.name)
                 if not ok then
+                    entry.calls_total  = (entry.calls_total  or 0) + 1
+                    entry.errors_total = (entry.errors_total or 0) + 1
                     return {
                         is_error = true,
                         content  = "mcp_server_dead: " .. server.name .. " — " .. tostring(rerr),
@@ -211,12 +224,19 @@ local function make_tool_manifest(server, mcp_tool, prefix)
 
             -- Wrap in pcall so sem:post() is guaranteed even if call_and_wait
             -- raises an unexpected Lua error (nil-deref, library throw, etc.).
+            entry.in_flight = (entry.in_flight or 0) + 1
+            local started_ms = ngx.now() * 1000
             local call_ok, result, call_err = pcall(call_and_wait, entry.proc, req)
             entry.sem:post()
+
+            entry.in_flight     = math.max(0, (entry.in_flight or 1) - 1)
+            entry.last_latency_ms = ngx.now() * 1000 - started_ms
+            entry.calls_total   = (entry.calls_total or 0) + 1
 
             if not call_ok then
                 -- result holds the error string thrown by the Lua runtime
                 entry.alive = false
+                entry.errors_total = (entry.errors_total or 0) + 1
                 return { is_error = true, content = "mcp_call_crashed: " .. tostring(result) }
             elseif not result then
                 -- Only pipe-level failures mean the server is gone.
@@ -226,6 +246,7 @@ local function make_tool_manifest(server, mcp_tool, prefix)
                 if call_err and (call_err:sub(1, 6) == "write:" or call_err:sub(1, 5) == "read:") then
                     entry.alive = false
                 end
+                entry.errors_total = (entry.errors_total or 0) + 1
                 return { is_error = true, content = "mcp_call_failed: " .. tostring(call_err) }
             end
 
@@ -236,6 +257,10 @@ local function make_tool_manifest(server, mcp_tool, prefix)
                 if blk.type == "text" and blk.text then
                     pieces[#pieces + 1] = blk.text
                 end
+            end
+
+            if result.isError then
+                entry.errors_total = (entry.errors_total or 0) + 1
             end
 
             return {
@@ -283,8 +308,9 @@ function bring_up(server)
         return nil, "tools/list: " .. tostring(lerr)
     end
 
-    -- Preserve attempt counter across respawns so backoff escalates;
-    -- reset on the first successful registration after respawn (in respawn()).
+    -- Preserve counters across respawns so backoff escalates and status
+    -- totals survive a crash; reset attempts on the first successful
+    -- registration after respawn (in respawn_if_due).
     -- The semaphore (1 resource) is the per-server pipe lock: it serialises
     -- concurrent tools/call round-trips so two light threads can't interleave
     -- writes/reads on the same stdio pipe. Preserved across respawns so a
@@ -298,6 +324,12 @@ function bring_up(server)
         last_attempt_ms = ngx.now() * 1000,
         alive           = true,
         sem             = (existing and existing.sem) or semaphore.new(1),
+        restarts        = (existing and existing.restarts) or 0,
+        tools           = {},
+        in_flight       = 0,
+        calls_total     = (existing and existing.calls_total) or 0,
+        errors_total    = (existing and existing.errors_total) or 0,
+        last_latency_ms = existing and existing.last_latency_ms,
     }
 
     -- Start draining stderr so the child can't deadlock on a full pipe.
@@ -314,6 +346,7 @@ function bring_up(server)
             ngx.log(ngx.WARN, "mcp register failed for ", manifest.name, ": ", rerr)
         end
     end
+    _servers[server.name].tools = registered
 
     return registered
 end
@@ -324,6 +357,7 @@ function respawn_if_due(server_name)
     local entry = _servers[server_name]
     if not entry then return false, "no spec for " .. server_name end
     if not entry.spec then return false, "no spec for " .. server_name end
+    if is_alive(entry) then return true end
 
     local now_ms      = ngx.now() * 1000
     local since_last  = now_ms - (entry.last_attempt_ms or 0)
@@ -352,17 +386,54 @@ function respawn_if_due(server_name)
         return false, err
     end
 
-    -- Success — reset attempt counter so the next failure starts at full
-    -- backoff window again rather than pinning at the cap.
-    if _servers[server_name] then
-        _servers[server_name].attempts = 0
+    -- Success — bump the cumulative restart counter and reset attempts so
+    -- the next failure starts at full backoff window again rather than
+    -- pinning at the cap.
+    local live = _servers[server_name]
+    if live then
+        live.attempts = 0
+        live.restarts = (live.restarts or 0) + 1
     end
     ngx.log(ngx.INFO, "mcp_server_respawned: ", server_name,
                       " (", #registered, " tools re-registered)")
     return true
 end
 
--- Read and validate the config file, then bring up every server.
+-- Background sweep: respawn any server whose subprocess has died. Runs on a
+-- timer so recovery does not depend on a tool call arriving; the stderr
+-- drainer flips entry.alive on EOF, and this picks it up within one interval.
+-- Backoff is enforced inside respawn_if_due, so a broken server is retried at
+-- most once per its current backoff window.
+function supervise()
+    for name, entry in pairs(_servers) do
+        if entry.spec and not is_alive(entry) then
+            respawn_if_due(name)
+        end
+    end
+end
+
+-- Arm the supervisor timer once per worker. load_manifest runs in a timer
+-- phase (see init.lua bootstrap_mcp), where ngx.timer.every is available; if
+-- timers are unavailable (unit tests) we no-op and rely on lazy respawn.
+local function start_supervisor()
+    if _supervisor_started then return end
+    if not (ngx and ngx.timer and ngx.timer.every) then return end
+    local ok, err = ngx.timer.every(SUPERVISE_INTERVAL_S, function(premature)
+        if premature then return end
+        local sok, serr = pcall(supervise)
+        if not sok then ngx.log(ngx.WARN, "mcp supervise sweep failed: ", serr) end
+    end)
+    if ok then
+        _supervisor_started = true
+        ngx.log(ngx.INFO, "mcp supervisor armed (every ", SUPERVISE_INTERVAL_S, "s)")
+    else
+        ngx.log(ngx.WARN, "mcp supervisor timer failed to start: ", err)
+    end
+end
+
+-- Read and validate the config file, then bring up every server and arm the
+-- supervisor. Called from registry.bootstrap_mcp inside an ngx.timer (init.lua),
+-- where ngx.pipe cosocket I/O and ngx.timer.every are both permitted.
 function _M.load_manifest(path)
     local f, ferr = io.open(path, "rb")
     if not f then return nil, "read " .. path .. ": " .. tostring(ferr) end
@@ -381,6 +452,25 @@ function _M.load_manifest(path)
         if not server.name or not server.command then
             ngx.log(ngx.WARN, "mcp server entry missing name/command — skipped")
         else
+            -- Pre-seed a dead stub so the supervisor has a spec to retry even
+            -- if bring_up fails on the first attempt. bring_up replaces this
+            -- entry on success; on failure it remains with alive=false.
+            if not _servers[server.name] then
+                _servers[server.name] = {
+                    spec            = server,
+                    alive           = false,
+                    attempts        = 0,
+                    last_attempt_ms = 0,
+                    sem             = semaphore.new(1),
+                    restarts        = 0,
+                    tools           = {},
+                    in_flight       = 0,
+                    calls_total     = 0,
+                    errors_total    = 0,
+                }
+            else
+                _servers[server.name].spec = server
+            end
             local registered, err = bring_up(server)
             if not registered then
                 ngx.log(ngx.WARN, "mcp server '", server.name, "' bring-up failed: ", err)
@@ -391,17 +481,53 @@ function _M.load_manifest(path)
             end
         end
     end
+
+    start_supervisor()
     return all_registered
 end
 
+-- Point-in-time status of every supervised server. Consumed by the
+-- GET /v1/mcp/servers endpoint and the CLI status view.
+function _M.status()
+    local out = {}
+    for name, e in pairs(_servers) do
+        local pid
+        if e.proc then
+            local ok, p = pcall(function() return e.proc:pid() end)
+            if ok then pid = p end
+        end
+        out[#out + 1] = {
+            name            = name,
+            alive           = is_alive(e),
+            pid             = pid,
+            command         = e.spec and e.spec.command,
+            restarts        = e.restarts or 0,
+            attempts        = e.attempts or 0,
+            tools           = e.tools or {},
+            tool_count      = e.tools and #e.tools or 0,
+            in_flight       = e.in_flight or 0,
+            calls_total     = e.calls_total or 0,
+            errors_total    = e.errors_total or 0,
+            last_latency_ms = e.last_latency_ms,
+        }
+    end
+    table.sort(out, function(a, b) return a.name < b.name end)
+    return out
+end
+
 -- Test / introspection helpers.
-_M._servers = function() return _servers end
+_M._servers            = function() return _servers end
+_M._backoff_ms         = backoff_ms
+_M._is_alive           = is_alive
+_M._make_tool_manifest = make_tool_manifest
+_M._supervise          = function() return supervise() end
 
 function _M._reset_for_test()
     for _, e in pairs(_servers) do
-        if e.proc then e.proc:shutdown("stdin") end
+        if e.proc then pcall(function() e.proc:shutdown("stdin") end) end
     end
     _servers = {}
+    _supervisor_started = false
 end
 
 return _M
