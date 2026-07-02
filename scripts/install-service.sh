@@ -29,7 +29,10 @@ case "${1:-install}" in
         [ -f "$TEMPLATE" ] || { echo "template missing: $TEMPLATE" >&2; exit 1; }
         mkdir -p "$HOME/Library/LaunchAgents" "$PREFIX/logs" "$PREFIX/run"
 
-        sed -e "s|__REPO__|$PREFIX|g" -e "s|__PATH__|$PATH|g" "$TEMPLATE" > "$PLIST_DST"
+        content=$(cat "$TEMPLATE")
+        content="${content//__REPO__/$PREFIX}"
+        content="${content//__PATH__/$PATH}"
+        echo "$content" > "$PLIST_DST"
 
         launchctl unload "$PLIST_DST" 2>/dev/null || true
         if launchctl load -w "$PLIST_DST"; then
