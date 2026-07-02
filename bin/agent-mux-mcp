@@ -43,6 +43,30 @@ def write_line(obj) -> None:
     sys.stdout.flush()
 
 
+def is_jsonrpc_response(obj) -> bool:
+    return isinstance(obj, dict) and obj.get("jsonrpc") == "2.0" and (
+        "result" in obj or "error" in obj
+    )
+
+
+def error_replies(msg, msg_id, message):
+    """Build a JSON-RPC error reply (or list of replies for a batch) tied to
+    the original request id(s). Returns None if `msg` was a notification
+    (nothing should be written back)."""
+    if isinstance(msg, list):
+        errs = [
+            {"jsonrpc": "2.0", "id": m.get("id"),
+             "error": {"code": -32000, "message": message}}
+            for m in msg
+            if isinstance(m, dict) and m.get("id") is not None
+        ]
+        return errs or None
+    if msg_id is not None:
+        return {"jsonrpc": "2.0", "id": msg_id,
+                "error": {"code": -32000, "message": message}}
+    return None
+
+
 def main() -> None:
     for line in sys.stdin:
         line = line.strip()
@@ -61,52 +85,46 @@ def main() -> None:
             # client expects a response (i.e. this was a request, not a
             # notification). For batch requests, return an error per item
             # that has an id.
-            err_msg = "gateway unreachable: " + body.decode(errors="replace")
-            if isinstance(msg, list):
-                errs = [
-                    {"jsonrpc": "2.0", "id": m.get("id"),
-                     "error": {"code": -32000, "message": err_msg}}
-                    for m in msg
-                    if isinstance(m, dict) and m.get("id") is not None
-                ]
-                if errs:
-                    write_line(errs)
-            elif msg_id is not None:
-                write_line({
-                    "jsonrpc": "2.0", "id": msg_id,
-                    "error": {"code": -32000, "message": err_msg},
-                })
+            reply = error_replies(msg, msg_id, "gateway unreachable: " + body.decode(errors="replace"))
+            if reply is not None:
+                write_line(reply)
             continue
 
         if status == 202 or not body:
             # Notification accepted — nothing to write back.
             continue
 
-        # Validate before forwarding — HTTP error bodies (401, 400, nginx pages)
-        # are not JSON-RPC responses and must not be written raw to stdout.
-        try:
-            resp_obj = json.loads(body)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            resp_obj = None
+        body_str = body.decode("utf-8", errors="replace")
 
-        if isinstance(resp_obj, list) or (
-            isinstance(resp_obj, dict) and "jsonrpc" in resp_obj
-        ):
-            # Well-formed JSON-RPC: single response or batch array.
-            write_line(resp_obj)
-        elif msg_id is not None:
-            # Non-JSON-RPC body (plain-text proxy error, auth rejection, etc.)
-            # — surface as a correlated error tied to the original request id.
-            write_line({
-                "jsonrpc": "2.0", "id": msg_id,
-                "error": {
-                    "code": -32000,
-                    "message": "gateway http {}: {}".format(
-                        status, body.decode("utf-8", errors="replace")[:500]
-                    ),
-                },
-            })
-        # else: notification with no id — drop rather than corrupt the stream.
+        if status >= 400:
+            # HTTP-level error (auth, size cap, parse error, upstream/proxy
+            # failure). The body may be a JSON error object without
+            # jsonrpc/id fields, or a plain-text proxy error — neither is a
+            # valid MCP reply, so normalize it into a JSON-RPC error tied to
+            # the original request id instead of passing it through.
+            reply = error_replies(msg, msg_id, f"gateway error {status}: {body_str}")
+            if reply is not None:
+                write_line(reply)
+            continue
+
+        try:
+            parsed = json.loads(body_str)
+        except json.JSONDecodeError:
+            parsed = None
+
+        if parsed is None or not (isinstance(parsed, list) or is_jsonrpc_response(parsed)):
+            # 2xx but not a well-formed JSON-RPC response/batch — don't dump
+            # the raw body to stdout, normalize it instead.
+            reply = error_replies(msg, msg_id, f"invalid gateway response: {body_str}")
+            if reply is not None:
+                write_line(reply)
+            continue
+
+        # Write the gateway response directly — it is a valid JSON-RPC reply.
+        sys.stdout.write(body_str)
+        if not body_str.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
