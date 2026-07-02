@@ -208,7 +208,7 @@ function _M.mcp_gateway()
     -- value so malformed ids don't propagate into Redis keys or logs.
     -- Fall back to a per-IP id so anonymous clients don't all share one bucket.
     local session_id = ngx.req.get_headers()["X-Session-Id"]
-    if not session_id or not session_id:match("^[A-Za-z0-9_-]+$") or #session_id > 128 then
+    if type(session_id) ~= "string" or not session_id:match("^[A-Za-z0-9_-]+$") or #session_id > 128 then
         local ip = ngx.var.remote_addr or "unknown"
         session_id = "mcp-" .. ip:gsub("[^A-Za-z0-9]", "-")
     end
