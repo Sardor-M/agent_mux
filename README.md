@@ -66,11 +66,71 @@ curl -N -X POST localhost:8080/v1/agents \
      --data @examples/agent_request.json           # streams SSE
 ```
 
+## Use it as an MCP gateway
+
+Point Claude Code and Codex at agent_mux instead of wiring each MCP server
+into each client separately. Every inline, HTTP, and supervised MCP tool is
+exposed through one endpoint, and every `tools/call` runs the same auth →
+per-tool rate limit → hooks → metrics path as the agent loop. The result is
+one supervised, observable, policy-enforced MCP surface shared across every
+coding agent you point at it — with a single place to see what your agents
+actually called.
+
+Boot agent_mux with your MCP manifest:
+
+```bash
+export AGENT_MUX_API_KEYS=test-key
+export AGENT_MUX_MCP_FILE=examples/tools/mcp_servers.json
+make demo
+```
+
+**Claude Code / Codex (HTTP transport)** — add to `.mcp.json`:
+
+```jsonc
+{
+  "mcpServers": {
+    "mux": {
+      "type": "http",
+      "url": "http://localhost:8080/mcp",
+      "headers": { "X-API-Key": "test-key" }
+    }
+  }
+}
+```
+
+**stdio-only clients** — use the bundled bridge instead:
+
+```jsonc
+{
+  "mcpServers": {
+    "mux": {
+      "command": "/abs/path/to/agent_mux/bin/agent-mux-mcp",
+      "env": {
+        "AGENT_MUX_MCP_URL": "http://localhost:8080/mcp",
+        "AGENT_MUX_API_KEY": "test-key"
+      }
+    }
+  }
+}
+```
+
+Watch the fleet while your agents work:
+
+```bash
+make status        # one-shot table
+make watch         # live-refreshing view, leave it open next to your editor
+curl localhost:8080/v1/mcp/servers | jq   # JSON, for a dashboard
+```
+
+Inside Claude Code, the `/mcp-status` command summarises the same fleet.
+
 ## HTTP surface
 
 | Route                          | Purpose                                                    |
 |--------------------------------|------------------------------------------------------------|
 | `POST /v1/agents`              | Start an agent run; streams SSE deltas + tool events       |
+| `POST /mcp`                    | Northbound MCP gateway (Streamable-HTTP) for MCP clients    |
+| `GET  /v1/mcp/servers`         | Supervised MCP server status (JSON, or `?format=text`)     |
 | `DELETE /v1/sessions/:id`      | Cancel an in-flight session gracefully                     |
 | `GET  /healthz`                | Liveness check + redis health probe                        |
 | `GET  /metrics`                | Prometheus exposition                                      |
@@ -82,7 +142,9 @@ curl -N -X POST localhost:8080/v1/agents \
 conf/nginx.conf                OpenResty config — env, locations, phases
 lua/agent_mux/
   ├─ tools/                    registry, dispatcher, inline / HTTP / MCP handlers
-  │   └─ mcp.lua               stdio MCP client + subprocess respawn
+  │   └─ mcp.lua               stdio MCP client + subprocess respawn + supervisor
+  ├─ gateway/
+  │   └─ mcp_server.lua        northbound MCP server (agent_mux as a gateway)
   ├─ transport/
   │   ├─ jsonrpc.lua           JSON-RPC 2.0 framing for MCP stdio
   │   └─ sse.lua               SSE encoder for client responses
@@ -96,12 +158,14 @@ lua/agent_mux/
   ├─ scripts/                  atomic Redis Lua scripts (budget, concurrency, RL)
   ├─ redis_client.lua          pooled cosocket client + script registry
   └─ errors.lua                shared error taxonomy
+bin/agent-mux-mcp              stdio↔HTTP bridge for stdio-only MCP clients
+scripts/agent-mux-status.sh    CLI status view (make status / make watch)
 examples/
   ├─ tools/mcp_demo/           stdio MCP server in Python — supervised by agent_mux
   ├─ tools/mcp_servers.json    MCP manifest the supervisor reads
   ├─ tools/inline_calculator.lua, http_search/, http_tools.json
   └─ hooks/audit_log.lua       reference audit hook
-tests/                         busted unit + integration suite (67 tests)
+tests/                         busted unit + integration suite (85 tests)
 bench/                         wrk harness + baseline output
 ```
 
@@ -134,9 +198,6 @@ parity. None of these block the use cases above; they're the work that turns
 agent_mux into something an operations team can manage as a first-class
 service:
 
-- **`GET /v1/mcp/servers`** — list supervised servers with restart count,
-  in-flight calls, last-call latency, status. Right now you read
-  `logs/error.log` to see what MCP is doing.
 - **Hot-reload of `AGENT_MUX_MCP_FILE`** — add or replace an MCP server
   without `make stop && make dev`.
 - **Per-MCP-server resource caps** — memory ceiling, max concurrent calls,

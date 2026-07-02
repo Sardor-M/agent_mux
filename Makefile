@@ -5,7 +5,7 @@ REDIS      := redis-server
 
 .DEFAULT_GOAL := help
 
-.PHONY: help check-deps dev stop demo test fmt clean dirs
+.PHONY: help check-deps dev stop demo test fmt clean dirs status watch
 
 help:                  ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -31,6 +31,12 @@ test:                  ## Run busted unit tests
 
 bench:                 ## Run wrk against /healthz, /metrics, /v1/agents
 	@bash scripts/bench.sh
+
+status:                ## Show supervised MCP server status (one-shot table)
+	@bash scripts/agent-mux-status.sh
+
+watch:                 ## Live-refreshing MCP server status (Ctrl+C to exit)
+	@bash scripts/agent-mux-status.sh --watch
 
 fmt:                   ## Format Lua sources with stylua if available
 	@command -v stylua >/dev/null && stylua lua/ tests/ examples/ || echo "stylua not installed — skipping"

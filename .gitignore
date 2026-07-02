@@ -25,3 +25,6 @@ results/
 .busted/
 
 docs/
+# Python bytecode (bridge compile checks)
+__pycache__/
+*.pyc

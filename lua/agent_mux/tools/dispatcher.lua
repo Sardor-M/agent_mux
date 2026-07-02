@@ -211,5 +211,15 @@ function _M._run_synchronous(session, tool_uses, sse)
     return results
 end
 
+-- run_single(session, use, sse) → one tool_result table.
+--
+-- Public single-shot entry used by the northbound MCP gateway, which
+-- dispatches one tool per JSON-RPC `tools/call`. Runs the identical
+-- auth → rate-limit → hook → execute → metrics path as the concurrent
+-- agent-loop dispatch, so gateway calls get the same policy treatment.
+function _M.run_single(session, use, sse)
+    return run_one(session, use, sse)
+end
+
 _M._run_one = run_one
 return _M
