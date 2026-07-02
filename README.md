@@ -165,7 +165,7 @@ examples/
   ├─ tools/mcp_servers.json    MCP manifest the supervisor reads
   ├─ tools/inline_calculator.lua, http_search/, http_tools.json
   └─ hooks/audit_log.lua       reference audit hook
-tests/                         busted unit + integration suite (84 tests)
+tests/                         busted unit + integration suite (85 tests)
 bench/                         wrk harness + baseline output
 ```
 

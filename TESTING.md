@@ -100,7 +100,7 @@ curl -N -X POST localhost:8080/v1/agents \
 
 Expected SSE event sequence (each line is `event: <name>\ndata: <json>\n\n`):
 
-```
+```text
 event: session_start         { "session_id": "sess_…", "model": "mock-claude" }
 event: turn_start             { "turn": 1 }
 event: model_chunk            { "turn": 1, "text": "Hello! …" }   (one or more)
@@ -135,7 +135,7 @@ curl -N -X POST localhost:8080/v1/agents \
 
 Look for these events in order:
 
-```
+```text
 event: turn_start                   { "turn": 1 }
 event: tool_dispatch_start          { "count": 2 }
 event: tool_call                    { "name": "calculator", … }
@@ -170,16 +170,22 @@ AGENT_MUX_MCP_FILE=examples/tools/mcp_servers.json \
 make demo
 ```
 
-Verify the supervised subprocess is up:
+Verify the supervised subprocess is up. Because `load_manifest` defers the
+initial spawn via `ngx.timer.at(0)`, the process appears shortly after nginx
+starts, not immediately. Poll until it appears (usually under 2s):
 
 ```bash
-ps -ef | grep -v grep | grep mcp_demo/server.py
+# Wait up to ~5s for the deferred bring-up to complete
+for i in $(seq 1 10); do
+  ps -ef | grep -v grep | grep mcp_demo/server.py && break
+  sleep 0.5
+done
 # → one python3 process, child of the openresty worker
 ```
 
 In the demo shell's stdout (or `logs/error.log`), you should see lines like:
 
-```
+```text
 [lua] mcp.lua: spawned MCP server "demo" (pid=NNNN)
 [lua] mcp.lua: registered 2 tools from "demo": demo:get_time, demo:echo
 ```
@@ -258,7 +264,7 @@ curl -N -X POST localhost:8080/v1/agents \
 
 The mock's first turn alone uses more than 5 tokens, so the loop should emit:
 
-```
+```text
 event: done   { "stop_reason": "budget_exhausted", "turns": 1 }
 ```
 

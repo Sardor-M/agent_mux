@@ -5,10 +5,10 @@
 -- to discover tools, and registers each one in the local registry with
 -- a `run` closure that sends `tools/call` over the pipe.
 --
--- Supervision: a background `ngx.timer.every` sweep respawns any server
--- whose subprocess has died, honouring exponential backoff. The tool-call
--- path also lazily respawns a dead server on demand, so a crash is
--- recovered either by the next sweep or the next call, whichever is first.
+-- Recovery is driven two ways: a background sweep (`ngx.timer.every`)
+-- respawns dead servers proactively, and the tool-call path respawns lazily
+-- on demand — whichever happens first. Death is surfaced by pipe/stderr
+-- errors flipping `entry.alive`, not by polling pid.
 --
 -- For week 3 v0.1 we support **stdio only** with newline-delimited JSON
 -- framing (the simpler MCP transport). The HTTP/SSE transport is a
@@ -29,9 +29,10 @@
 --     ]
 --   }
 
-local cjson    = require("cjson.safe")
-local jsonrpc  = require("agent_mux.transport.jsonrpc")
-local registry = require("agent_mux.tools.registry")
+local cjson     = require("cjson.safe")
+local jsonrpc   = require("agent_mux.transport.jsonrpc")
+local registry  = require("agent_mux.tools.registry")
+local semaphore = require("ngx.semaphore")
 
 local _M = {}
 
@@ -40,36 +41,79 @@ local _M = {}
 -- many tools/call invocations.
 --
 -- Each entry shape:
---   { proc, info, spec, attempts, restarts, last_attempt_ms, last_spawn_ms,
---     tools = {names...}, in_flight, calls_total, errors_total, last_latency_ms }
+--   { proc, info, spec, attempts, last_attempt_ms, alive, sem,
+--     restarts, tools, in_flight, calls_total, errors_total, last_latency_ms }
 local _servers = {}
 local _supervisor_started = false
 
 local DEFAULT_TIMEOUT_MS   = 5000
 local SUPERVISE_INTERVAL_S = 5     -- how often the supervisor sweeps for dead servers
 
--- Forward declarations. `make_tool_manifest`'s run closure and the
--- supervisor reference `respawn_if_due` / `bring_up` before their
--- definitions; Lua binds upvalues lexically at definition time, so these
--- MUST be declared as locals up here or the references resolve to nil
--- globals. (That was the respawn bug: the closure called a nil global.)
-local bring_up, respawn_if_due, supervise
+-- Forward declarations — these are referenced by closures defined earlier
+-- in the file than their `function` bodies. Without the `local` here, the
+-- earlier references would compile to *global* lookups (always nil) and the
+-- respawn path would crash with "attempt to call a nil value".
+local respawn_if_due
+local bring_up
+local supervise
 
--- Exponential backoff on respawn — caps at 30s so a permanently broken
--- server doesn't hammer the host but we keep retrying eventually.
+-- Exponential backoff on respawn — the exponent is clamped at 8, so the
+-- effective ceiling is 2^8 * 100 = 25600ms; the outer min(30000, …) never
+-- binds. Keeps a permanently broken server from hammering the host while
+-- still retrying eventually.
 local function backoff_ms(attempts)
     return math.min(30000, (2 ^ math.min(attempts, 8)) * 100)
 end
 
--- Probe an MCP server's subprocess. Returns true if it's running and
--- usable, false if it has died or was never spawned.
+-- Probe an MCP server's subprocess. Returns true if it's believed running
+-- and usable, false if it has died or was never spawned.
+--
+-- We deliberately do NOT use proc:pid() for liveness: ngx.pipe's pid() is a
+-- static getter that returns the spawn-time pid forever — it does not become
+-- nil when the child exits. Death is instead surfaced as a write/read error
+-- on the pipe (or stderr EOF), at which point the call path / stderr drainer
+-- flips entry.alive = false. This flag is the source of truth.
 local function is_alive(entry)
     if not entry or not entry.proc then return false end
-    -- ngx.pipe procs expose `pid` while running; reading it returns nil
-    -- once the proc has exited or signaled.
-    local ok, pid = pcall(function() return entry.proc:pid() end)
-    if not ok then return false end
-    return pid ~= nil
+    return entry.alive ~= false
+end
+
+-- Continuously drain a server's stderr so its pipe buffer can never fill.
+-- A stdio MCP server that logs to stderr (the Python SDK does) would
+-- otherwise block in write() once the ~64KB kernel buffer fills and stop
+-- servicing stdin — a silent, unrecoverable wedge. We run this in a timer
+-- (cosocket phase) and log each line. stderr EOF ("closed") is also our
+-- cleanest death signal, so we flip entry.alive there.
+local function start_stderr_drainer(server_name, proc)
+    local ok, terr = ngx.timer.at(0, function(premature)
+        if premature then return end
+        while true do
+            if ngx.worker and ngx.worker.exiting and ngx.worker.exiting() then return end
+            local cur = _servers[server_name]
+            -- If the server was respawned, `proc` is stale — this drainer
+            -- belongs to the old process and should exit; the new process
+            -- has its own drainer.
+            if not cur or cur.proc ~= proc then return end
+
+            local line, rerr = proc:stderr_read_line()
+            if line then
+                ngx.log(ngx.INFO, "mcp[", server_name, "] stderr: ", line)
+            elseif rerr == "timeout" then
+                -- No output within the read timeout — loop and re-check
+                -- worker/respawn state.
+            else
+                -- "closed" / EOF / other error: the child's stderr is gone,
+                -- which means the process is gone. Mark dead and stop.
+                cur.alive = false
+                ngx.log(ngx.WARN, "mcp[", server_name,
+                    "] stderr closed (", tostring(rerr), ") — marking dead")
+                return
+            end
+        end
+    end)
+    if not ok then
+        ngx.log(ngx.WARN, "mcp[", server_name, "] could not start stderr drainer: ", terr)
+    end
 end
 
 -- Read newline-delimited JSON. Returns nil on EOF / timeout.
@@ -136,6 +180,8 @@ local function make_tool_manifest(server, mcp_tool, prefix)
             if not is_alive(entry) then
                 local ok, rerr = respawn_if_due(server.name)
                 if not ok then
+                    entry.calls_total  = (entry.calls_total  or 0) + 1
+                    entry.errors_total = (entry.errors_total or 0) + 1
                     return {
                         is_error = true,
                         content  = "mcp_server_dead: " .. server.name .. " — " .. tostring(rerr),
@@ -149,16 +195,59 @@ local function make_tool_manifest(server, mcp_tool, prefix)
                 arguments = input or {},
             })
 
-            entry.in_flight = (entry.in_flight or 0) + 1
-            local t0 = ngx.now() * 1000
-            local result, err = call_and_wait(entry.proc, req)
-            entry.in_flight = math.max(0, (entry.in_flight or 1) - 1)
-            entry.last_latency_ms = ngx.now() * 1000 - t0
-            entry.calls_total = (entry.calls_total or 0) + 1
+            -- Serialise pipe access: only one in-flight request per server,
+            -- so concurrent tool calls can't interleave on the shared stdio
+            -- pipe or steal each other's responses. Wait up to the tool's
+            -- timeout for the lock.
+            local timeout_s = (server.timeout_ms or DEFAULT_TIMEOUT_MS) / 1000
+            local lock_ok, lock_err = entry.sem:wait(timeout_s)
+            if not lock_ok then
+                return {
+                    is_error = true,
+                    content  = "mcp_busy: " .. server.name .. " — " .. tostring(lock_err),
+                }
+            end
 
-            if not result then
+            -- Re-fetch entry under the lock: the server may have been
+            -- respawned while we were waiting, giving us a fresh proc.
+            -- Also re-check liveness — if it died while we waited but no
+            -- respawn has run yet, fail fast rather than burning the timeout.
+            entry = _servers[server.name] or entry
+            if not is_alive(entry) then
+                entry.sem:post()
+                return {
+                    is_error = true,
+                    content  = "mcp_server_dead: " .. server.name
+                               .. " (died while waiting for lock)",
+                }
+            end
+
+            -- Wrap in pcall so sem:post() is guaranteed even if call_and_wait
+            -- raises an unexpected Lua error (nil-deref, library throw, etc.).
+            entry.in_flight = (entry.in_flight or 0) + 1
+            local started_ms = ngx.now() * 1000
+            local call_ok, result, call_err = pcall(call_and_wait, entry.proc, req)
+            entry.sem:post()
+
+            entry.in_flight     = math.max(0, (entry.in_flight or 1) - 1)
+            entry.last_latency_ms = ngx.now() * 1000 - started_ms
+            entry.calls_total   = (entry.calls_total or 0) + 1
+
+            if not call_ok then
+                -- result holds the error string thrown by the Lua runtime
+                entry.alive = false
                 entry.errors_total = (entry.errors_total or 0) + 1
-                return { is_error = true, content = "mcp_call_failed: " .. tostring(err) }
+                return { is_error = true, content = "mcp_call_crashed: " .. tostring(result) }
+            elseif not result then
+                -- Only pipe-level failures mean the server is gone.
+                -- JSON-RPC protocol errors (bad params, unknown method, etc.)
+                -- are valid responses from a healthy server and must NOT
+                -- trigger a respawn — only "write:" / "read:" prefixes do.
+                if call_err and (call_err:sub(1, 6) == "write:" or call_err:sub(1, 5) == "read:") then
+                    entry.alive = false
+                end
+                entry.errors_total = (entry.errors_total or 0) + 1
+                return { is_error = true, content = "mcp_call_failed: " .. tostring(call_err) }
             end
 
             -- MCP returns { content = [{type="text", text="..."}], isError = bool }.
@@ -183,8 +272,6 @@ local function make_tool_manifest(server, mcp_tool, prefix)
 end
 
 -- Spawn one server, run initialize handshake + tools/list, register tools.
--- Assigns to the forward-declared local (no `local` keyword) so the
--- closures above capture the real function.
 function bring_up(server)
     local ngx_pipe = require("ngx.pipe")
     local cmd = { server.command }
@@ -224,22 +311,29 @@ function bring_up(server)
     -- Preserve counters across respawns so backoff escalates and status
     -- totals survive a crash; reset attempts on the first successful
     -- registration after respawn (in respawn_if_due).
+    -- The semaphore (1 resource) is the per-server pipe lock: it serialises
+    -- concurrent tools/call round-trips so two light threads can't interleave
+    -- writes/reads on the same stdio pipe. Preserved across respawns so a
+    -- waiter blocked during a respawn still holds a valid lock afterward.
     local existing = _servers[server.name]
-    local now_ms   = ngx.now() * 1000
     _servers[server.name] = {
         proc            = proc,
         info            = init_res,
         spec            = server,
         attempts        = (existing and existing.attempts) or 0,
+        last_attempt_ms = ngx.now() * 1000,
+        alive           = true,
+        sem             = (existing and existing.sem) or semaphore.new(1),
         restarts        = (existing and existing.restarts) or 0,
-        last_attempt_ms = now_ms,
-        last_spawn_ms   = now_ms,
         tools           = {},
-        in_flight       = (existing and existing.in_flight) or 0,
+        in_flight       = 0,
         calls_total     = (existing and existing.calls_total) or 0,
         errors_total    = (existing and existing.errors_total) or 0,
         last_latency_ms = existing and existing.last_latency_ms,
     }
+
+    -- Start draining stderr so the child can't deadlock on a full pipe.
+    start_stderr_drainer(server.name, proc)
 
     -- 4. register every discovered tool
     local registered = {}
@@ -263,6 +357,7 @@ function respawn_if_due(server_name)
     local entry = _servers[server_name]
     if not entry then return false, "no spec for " .. server_name end
     if not entry.spec then return false, "no spec for " .. server_name end
+    if is_alive(entry) then return true end
 
     local now_ms      = ngx.now() * 1000
     local since_last  = now_ms - (entry.last_attempt_ms or 0)
@@ -275,6 +370,15 @@ function respawn_if_due(server_name)
     entry.last_attempt_ms = now_ms
     ngx.log(ngx.WARN, "mcp_server_died: respawning ", server_name,
                       " (attempt ", entry.attempts, ")")
+
+    -- Kill the stale process before spawning a new one to prevent leaks.
+    -- The proc may still be running if it was wedged/unresponsive rather
+    -- than self-terminated; pcall guards against a kill() error on an
+    -- already-dead handle.
+    if entry.proc then
+        pcall(entry.proc.kill, entry.proc, 9)
+        entry.proc = nil
+    end
 
     local registered, err = bring_up(entry.spec)
     if not registered then
@@ -295,10 +399,11 @@ function respawn_if_due(server_name)
     return true
 end
 
--- Background sweep: respawn any server whose subprocess has died. Runs on
--- a timer so recovery does not depend on a tool call arriving. Backoff is
--- enforced inside respawn_if_due, so a broken server is retried at most
--- once per its current backoff window.
+-- Background sweep: respawn any server whose subprocess has died. Runs on a
+-- timer so recovery does not depend on a tool call arriving; the stderr
+-- drainer flips entry.alive on EOF, and this picks it up within one interval.
+-- Backoff is enforced inside respawn_if_due, so a broken server is retried at
+-- most once per its current backoff window.
 function supervise()
     for name, entry in pairs(_servers) do
         if entry.spec and not is_alive(entry) then
@@ -307,9 +412,9 @@ function supervise()
     end
 end
 
--- Arm the supervisor timer once per worker. `ngx.timer.every` is available
--- from init_worker onward; if timers are unavailable (unit tests) we no-op
--- and rely on lazy tool-call respawn.
+-- Arm the supervisor timer once per worker. load_manifest runs in a timer
+-- phase (see init.lua bootstrap_mcp), where ngx.timer.every is available; if
+-- timers are unavailable (unit tests) we no-op and rely on lazy respawn.
 local function start_supervisor()
     if _supervisor_started then return end
     if not (ngx and ngx.timer and ngx.timer.every) then return end
@@ -326,12 +431,9 @@ local function start_supervisor()
     end
 end
 
--- Read and validate the config file, seed every server spec, and schedule
--- bring-up. Cosocket / ngx.pipe I/O is NOT permitted in the init_worker
--- phase (init.lua defers Redis SCRIPT LOAD for the same reason), so the
--- actual spawn is deferred to a zero-delay timer where it is allowed. We
--- seed specs synchronously first so the supervisor can retry any server
--- whose initial bring-up fails.
+-- Read and validate the config file, then bring up every server and arm the
+-- supervisor. Called from registry.bootstrap_mcp inside an ngx.timer (init.lua),
+-- where ngx.pipe cosocket I/O and ngx.timer.every are both permitted.
 function _M.load_manifest(path)
     local f, ferr = io.open(path, "rb")
     if not f then return nil, "read " .. path .. ": " .. tostring(ferr) end
@@ -345,49 +447,43 @@ function _M.load_manifest(path)
         return nil, "manifest missing 'servers' array"
     end
 
-    local specs = {}
+    local all_registered = {}
     for _, server in ipairs(servers) do
         if not server.name or not server.command then
             ngx.log(ngx.WARN, "mcp server entry missing name/command — skipped")
         else
-            local existing = _servers[server.name]
-            _servers[server.name] = existing or {
-                attempts = 0, restarts = 0, last_attempt_ms = 0,
-                in_flight = 0, calls_total = 0, errors_total = 0, tools = {},
-            }
-            _servers[server.name].spec = server
-            specs[#specs + 1] = server
-        end
-    end
-
-    local function bring_up_all(premature)
-        if premature then return end
-        for _, server in ipairs(specs) do
-            local ok, registered, berr = pcall(bring_up, server)
-            if not ok then
-                ngx.log(ngx.WARN, "mcp bring-up crashed for ", server.name, ": ", tostring(registered))
-            elseif not registered then
-                ngx.log(ngx.WARN, "mcp bring-up failed for ", server.name, ": ", tostring(berr))
+            -- Pre-seed a dead stub so the supervisor has a spec to retry even
+            -- if bring_up fails on the first attempt. bring_up replaces this
+            -- entry on success; on failure it remains with alive=false.
+            if not _servers[server.name] then
+                _servers[server.name] = {
+                    spec            = server,
+                    alive           = false,
+                    attempts        = 0,
+                    last_attempt_ms = 0,
+                    sem             = semaphore.new(1),
+                    restarts        = 0,
+                    tools           = {},
+                    in_flight       = 0,
+                    calls_total     = 0,
+                    errors_total    = 0,
+                }
+            else
+                _servers[server.name].spec = server
+            end
+            local registered, err = bring_up(server)
+            if not registered then
+                ngx.log(ngx.WARN, "mcp server '", server.name, "' bring-up failed: ", err)
+            else
+                for _, n in ipairs(registered) do
+                    all_registered[#all_registered + 1] = n
+                end
             end
         end
-        start_supervisor()
     end
 
-    if ngx and ngx.timer and ngx.timer.at then
-        local sched_ok, sched_err = ngx.timer.at(0, bring_up_all)
-        if not sched_ok then
-            ngx.log(ngx.WARN, "mcp bring-up timer failed to schedule: ", sched_err)
-            bring_up_all(false)
-        end
-    else
-        -- No timer facility (unit tests): bring up synchronously.
-        bring_up_all(false)
-    end
-
-    -- Tools register asynchronously; return the seeded server names.
-    local names = {}
-    for _, s in ipairs(specs) do names[#names + 1] = s.name end
-    return names
+    start_supervisor()
+    return all_registered
 end
 
 -- Point-in-time status of every supervised server. Consumed by the
