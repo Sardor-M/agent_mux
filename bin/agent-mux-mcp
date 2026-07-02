@@ -82,12 +82,31 @@ def main() -> None:
             # Notification accepted — nothing to write back.
             continue
 
-        # Write the gateway response directly — it is already valid JSON.
-        body_str = body.decode("utf-8", errors="replace")
-        sys.stdout.write(body_str)
-        if not body_str.endswith("\n"):
-            sys.stdout.write("\n")
-        sys.stdout.flush()
+        # Validate before forwarding — HTTP error bodies (401, 400, nginx pages)
+        # are not JSON-RPC responses and must not be written raw to stdout.
+        try:
+            resp_obj = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            resp_obj = None
+
+        if isinstance(resp_obj, list) or (
+            isinstance(resp_obj, dict) and "jsonrpc" in resp_obj
+        ):
+            # Well-formed JSON-RPC: single response or batch array.
+            write_line(resp_obj)
+        elif msg_id is not None:
+            # Non-JSON-RPC body (plain-text proxy error, auth rejection, etc.)
+            # — surface as a correlated error tied to the original request id.
+            write_line({
+                "jsonrpc": "2.0", "id": msg_id,
+                "error": {
+                    "code": -32000,
+                    "message": "gateway http {}: {}".format(
+                        status, body.decode("utf-8", errors="replace")[:500]
+                    ),
+                },
+            })
+        # else: notification with no id — drop rather than corrupt the stream.
 
 
 if __name__ == "__main__":
