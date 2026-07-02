@@ -156,6 +156,6 @@ case "${1:-}" in
     restart)    cmd_stop; sleep 1; cmd_start ;;
     status)     cmd_status ;;
     foreground) cmd_foreground ;;
-    logs)       exec tail -f "$PREFIX/logs/error.log" ;;
+    logs)       touch "$PREFIX/logs/error.log" && exec tail -f "$PREFIX/logs/error.log" ;;
     *)          echo "usage: $(basename "$0") {start|stop|restart|status|logs|foreground}" >&2; exit 2 ;;
 esac
