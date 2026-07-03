@@ -32,8 +32,12 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- Restart on crash (non-zero exit) but not on a clean 'make down' (exit 0). -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 
     <key>StandardOutPath</key>
     <string>__REPO__/logs/launchd.out.log</string>
