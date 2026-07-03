@@ -10,7 +10,7 @@
 
 set -uo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 PREFIX="$PWD"
 LABEL="com.agentmux.gateway"
 TEMPLATE="$PREFIX/conf/launchd/$LABEL.plist.template"
@@ -29,24 +29,27 @@ case "${1:-install}" in
         [ -f "$TEMPLATE" ] || { echo "template missing: $TEMPLATE" >&2; exit 1; }
         mkdir -p "$HOME/Library/LaunchAgents" "$PREFIX/logs" "$PREFIX/run"
 
+        # Use bash substitution instead of sed to avoid delimiter collision if
+        # $PREFIX or $PATH contain characters like |, &, or <.
         content=$(cat "$TEMPLATE")
         content="${content//__REPO__/$PREFIX}"
         content="${content//__PATH__/$PATH}"
-        echo "$content" > "$PLIST_DST"
+        printf '%s\n' "$content" > "$PLIST_DST"
 
-        launchctl unload "$PLIST_DST" 2>/dev/null || true
-        if launchctl load -w "$PLIST_DST"; then
+        # launchctl load -w is deprecated since macOS 10.10; use bootstrap/bootout.
+        launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+        if launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"; then
             echo "installed + loaded: $PLIST_DST"
             echo "agent_mux now auto-starts at login and restarts on crash."
             echo "  status:  make status"
-            echo "  stop:    make service-uninstall   (or: launchctl unload -w $PLIST_DST)"
+            echo "  stop:    make service-uninstall"
         else
             echo "failed to load $PLIST_DST — check logs/launchd.err.log" >&2
             exit 1
         fi
         ;;
     uninstall)
-        launchctl unload -w "$PLIST_DST" 2>/dev/null || true
+        launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
         rm -f "$PLIST_DST"
         echo "removed launchd agent: $PLIST_DST"
         echo "(the current background process, if any, keeps running until 'make down')"
