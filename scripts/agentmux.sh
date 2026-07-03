@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 PREFIX="$PWD"
 
 # Load optional local config, exporting everything it sets so it crosses into
@@ -96,11 +96,20 @@ cmd_start() {
     fi
     command -v "$OPENRESTY" >/dev/null 2>&1 \
         || die "$OPENRESTY not found — brew install openresty/brew/openresty"
+    local redis_owned_before
+    redis_running && redis_owned_before=1 || redis_owned_before=0
     start_redis
     log "starting OpenResty (daemon) on :8080"
-    # nginx daemonizes by default; the master pidfile is run/nginx.pid (nginx.conf).
-    "$OPENRESTY" -p "$PREFIX/" -c "$PREFIX/conf/nginx.conf" \
-        || die "OpenResty failed to start — see logs/error.log"
+    # nginx daemonizes by default; the master pidfile is run/nginx.cid (nginx.conf).
+    if ! "$OPENRESTY" -p "$PREFIX/" -c "$PREFIX/conf/nginx.conf"; then
+        # Roll back redis only if we started it (not if it was already running).
+        if [ "$redis_owned_before" -eq 0 ] && redis_running; then
+            log "rolling back — stopping redis (OpenResty failed to start)"
+            kill "$(cat "$REDIS_PID")" 2>/dev/null || true
+            rm -f "$REDIS_PID"
+        fi
+        die "OpenResty failed to start — see logs/error.log"
+    fi
     if wait_healthy; then
         log "up ✓   health: $HOST/healthz   gateway: $HOST/mcp   fleet: make status"
     else
@@ -109,17 +118,30 @@ cmd_start() {
 }
 
 cmd_stop() {
+    local i nginx_pid redis_pid
     if nginx_running; then
         log "stopping OpenResty (graceful drain)…"
+        nginx_pid="$(cat "$NGINX_PID" 2>/dev/null)"
         "$OPENRESTY" -p "$PREFIX/" -c "$PREFIX/conf/nginx.conf" -s quit 2>/dev/null \
             || "$OPENRESTY" -p "$PREFIX/" -c "$PREFIX/conf/nginx.conf" -s stop 2>/dev/null \
-            || true
+            || kill "$nginx_pid" 2>/dev/null || true
+        # Wait up to 5 s for the master to exit before proceeding (prevents
+        # a rapid restart from racing against a still-draining master).
+        for i in $(seq 1 20); do
+            nginx_running || break
+            sleep 0.25
+        done
     else
         log "OpenResty not running"
     fi
     if redis_running; then
         log "stopping redis…"
-        kill "$(cat "$REDIS_PID")" 2>/dev/null || true
+        redis_pid="$(cat "$REDIS_PID" 2>/dev/null)"
+        kill "$redis_pid" 2>/dev/null || true
+        for i in $(seq 1 50); do
+            redis_running || break
+            sleep 0.1
+        done
         rm -f "$REDIS_PID"
     fi
 }
@@ -156,6 +178,6 @@ case "${1:-}" in
     restart)    cmd_stop; sleep 1; cmd_start ;;
     status)     cmd_status ;;
     foreground) cmd_foreground ;;
-    logs)       touch "$PREFIX/logs/error.log" && exec tail -f "$PREFIX/logs/error.log" ;;
+    logs)       mkdir -p "$PREFIX/logs"; touch "$PREFIX/logs/error.log"; exec tail -f "$PREFIX/logs/error.log" ;;
     *)          echo "usage: $(basename "$0") {start|stop|restart|status|logs|foreground}" >&2; exit 2 ;;
 esac
