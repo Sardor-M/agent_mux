@@ -209,8 +209,11 @@ bench/                         wrk harness + baseline output
 make help               # list everything
 make up                 # run in the background (daemonized redis + OpenResty)
 make down               # graceful stop of the background service
+make restart            # stop + start (drains in-flight sessions first)
 make status             # up/down + supervised MCP servers
+make logs               # tail the worker log
 make service-install    # auto-start at login + restart on crash (macOS launchd)
+make service-uninstall  # remove the launchd agent
 make demo               # boot redis + OpenResty in the foreground for a live run
 make dev                # OpenResty in foreground (you bring redis)
 make test               # busted unit + integration suite
