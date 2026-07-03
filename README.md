@@ -124,6 +124,30 @@ curl localhost:8080/v1/mcp/servers | jq   # JSON, for a dashboard
 
 Inside Claude Code, the `/mcp-status` command summarises the same fleet.
 
+## Run it in the background
+
+No Docker, no babysitting. `make dev`/`make demo` run in the foreground; to
+have the gateway just *stay up* while you work, run it as a background service:
+
+```bash
+make up          # daemonize redis + OpenResty, then poll /healthz
+make status      # up/down + which MCP servers are supervised
+make logs        # tail the worker log
+make down        # graceful stop (drains in-flight sessions)
+```
+
+Make it start automatically at login and restart on crash (macOS, via launchd):
+
+```bash
+make service-install     # ~/Library/LaunchAgents/com.agentmux.gateway.plist
+make service-uninstall   # remove it
+```
+
+It works with **zero config** for local use — auth runs allow-all in dev
+without keys, and the demo MCP server is supervised out of the box. Drop a
+`.env` (copy `.env.example`) to set API keys, your own MCP manifest, or ports.
+On Linux, point a systemd unit at `scripts/agentmux.sh foreground`.
+
 ## HTTP surface
 
 | Route                          | Purpose                                                    |
@@ -183,11 +207,17 @@ bench/                         wrk harness + baseline output
 
 ```bash
 make help               # list everything
-make demo               # boot redis + OpenResty for an end-to-end run
+make up                 # run in the background (daemonized redis + OpenResty)
+make down               # graceful stop of the background service
+make restart            # stop + start (drains in-flight sessions first)
+make status             # up/down + supervised MCP servers
+make logs               # tail the worker log
+make service-install    # auto-start at login + restart on crash (macOS launchd)
+make service-uninstall  # remove the launchd agent
+make demo               # boot redis + OpenResty in the foreground for a live run
 make dev                # OpenResty in foreground (you bring redis)
 make test               # busted unit + integration suite
 make bench              # wrk against /healthz, /metrics, /v1/agents
-make stop               # stop a backgrounded OpenResty
 make clean              # clear logs/ and run/
 ```
 
