@@ -24,8 +24,11 @@ if [[ -n "${AGENT_MUX_API_KEY:-}" ]]; then
 fi
 
 fetch() {
-  curl -fsS --max-time 5 "${AUTH[@]}" "$URL" 2>/dev/null \
-    || printf 'agent_mux unreachable at %s\n(is it running? try: make demo)\n' "$HOST"
+  # ${AUTH[@]+"${AUTH[@]}"} is the bash-3.2-safe empty-array expansion: with
+  # `set -u`, a bare "${AUTH[@]}" on an empty array errors "unbound variable"
+  # on macOS's stock bash 3.2. This form expands to nothing when AUTH is empty.
+  curl -fsS --max-time 5 ${AUTH[@]+"${AUTH[@]}"} "$URL" 2>/dev/null \
+    || printf 'agent_mux unreachable at %s\n(is it running? try: make up)\n' "$HOST"
 }
 
 if [[ "${1:-}" == "--watch" ]]; then
