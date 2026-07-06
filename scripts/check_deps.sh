@@ -22,6 +22,11 @@ echo "AgentMux dep check:"
 check openresty   "brew install openresty/brew/openresty"
 check redis-server "brew install redis"
 
+# Only required deps gate startup. Snapshot the failure count here so the
+# optional tools below (busted/wrk/stylua) can be missing without aborting
+# `make up`/`make dev`.
+required_fail=$fail
+
 echo
 echo "Optional (for tests / bench / formatting):"
 check busted "luarocks install busted"
@@ -29,7 +34,7 @@ check wrk    "brew install wrk"
 check stylua "brew install stylua"
 
 echo
-if [ "$fail" -gt 0 ]; then
+if [ "$required_fail" -gt 0 ]; then
     echo "Required deps missing — install above and re-run." >&2
     exit 1
 fi
