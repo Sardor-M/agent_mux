@@ -127,7 +127,9 @@ end
 local function write_message(proc, msg)
     local body = jsonrpc.encode(msg)
     if not body then return false, "encode failed" end
-    local ok, err = proc:stdin_write(body .. "\n")
+    -- ngx.pipe's proc method is `write` (see lualib/ngx/pipe.lua); there is no
+    -- `stdin_write`, and calling it FFI-errors "struct has no member".
+    local ok, err = proc:write({body, "\n"})
     if not ok then return false, err end
     return true
 end

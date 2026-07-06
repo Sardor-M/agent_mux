@@ -51,8 +51,9 @@ package.preload["ngx.pipe"] = function()
             function proc:shutdown() end
             function proc:kill() end
             function proc:pid() return 4242 end
-            function proc:stdin_write(data)
-                for line in tostring(data):gmatch("[^\n]+") do
+            function proc:write(data)
+                local raw = type(data) == "table" and table.concat(data) or tostring(data)
+                for line in raw:gmatch("[^\n]+") do
                     local msg = cj.decode(line)
                     if type(msg) == "table" and msg.id ~= nil then
                         local result

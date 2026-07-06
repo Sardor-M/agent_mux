@@ -110,7 +110,7 @@ function _M.bootstrap(config)
 end
 
 -- Bring up MCP servers. Split out from bootstrap() because ngx.pipe
--- stdin_write/stdout_read_line are forbidden in init_worker_by_lua* — this
+-- write/stdout_read_line are forbidden in init_worker_by_lua* — this
 -- must run from a timer (or request) phase. Errors in one manifest do not
 -- stop the others.
 function _M.bootstrap_mcp(config)
