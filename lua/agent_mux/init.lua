@@ -74,7 +74,7 @@ function _M.init_worker()
                 ngx.log(ngx.WARN, "redis script load failed (will retry per-call): ", serr)
             end
 
-            -- MCP bring-up also lives here: ngx.pipe stdin_write/stdout_read_line
+            -- MCP bring-up also lives here: ngx.pipe write/stdout_read_line
             -- are disabled in init_worker_by_lua* but allowed in a timer phase.
             local mok, merr = pcall(function()
                 require("agent_mux.tools.registry").bootstrap_mcp(config)
