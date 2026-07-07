@@ -1,19 +1,29 @@
 -- tools/mcp.lua  —  Model Context Protocol client (stdio transport) + supervisor.
 --
--- Spawns each configured MCP server as a subprocess via `ngx.pipe`,
--- performs the JSON-RPC 2.0 initialize handshake, calls `tools/list`
--- to discover tools, and registers each one in the local registry with
--- a `run` closure that sends `tools/call` over the pipe.
+-- Spawns each configured MCP server as a subprocess via `ngx.pipe`, performs
+-- the JSON-RPC 2.0 initialize handshake, calls `tools/list` to discover tools,
+-- and registers each one in the local registry.
 --
--- Recovery is driven two ways: a background sweep (`ngx.timer.every`)
--- respawns dead servers proactively, and the tool-call path respawns lazily
--- on demand — whichever happens first. Death is surfaced by pipe/stderr
--- errors flipping `entry.alive`, not by polling pid.
+-- ## Ownership model (why the "manager" light-thread exists)
 --
--- For week 3 v0.1 we support **stdio only** with newline-delimited JSON
--- framing (the simpler MCP transport). The HTTP/SSE transport is a
--- stretch goal — the JSON-RPC layer is shared, so adding it is largely
--- swapping the read/write helpers.
+-- ngx.pipe binds a spawned subprocess to the light-thread that created it: when
+-- that request/timer callback returns, OpenResty reaps the child (the proc
+-- cdata even has a `__gc` finalizer that kills it). So a subprocess spawned in
+-- a transient timer or request handler dies the instant that context ends —
+-- storing the handle in a module table does NOT keep it alive. (That was the
+-- flapping-RESTARTS bug: every sweep respawned the server, and it died again
+-- the moment the sweep callback returned.)
+--
+-- The fix: each server gets ONE persistent "manager" light-thread (a timer
+-- callback that loops for the worker's lifetime). The manager spawns and *owns*
+-- the subprocess and is the only code that touches the pipe. Tool-call handlers
+-- never spawn or read the pipe; they push a request onto the server's queue,
+-- signal the manager via a semaphore, and await the reply on a per-request
+-- semaphore. Because the manager never returns, the subprocess is never reaped,
+-- and because the manager services one request at a time, pipe access is
+-- naturally serialised.
+--
+-- stdio only, newline-delimited JSON framing.
 --
 -- Configuration shape (read from a JSON file at bootstrap):
 --
@@ -36,74 +46,53 @@ local semaphore = require("ngx.semaphore")
 
 local _M = {}
 
--- One process per MCP server, alive for the lifetime of the worker.
--- Keyed by server name so we can re-use the connection across
--- many tools/call invocations.
---
--- Each entry shape:
---   { proc, info, spec, attempts, last_attempt_ms, alive, sem,
---     restarts, tools, in_flight, calls_total, errors_total, last_latency_ms }
+-- One entry per MCP server, keyed by name. Entry shape:
+--   { spec, proc, info, alive, ever_up,
+--     attempts, last_attempt_ms, restarts,
+--     queue = {reqobj...}, work = semaphore, manager_started,
+--     tools = {names}, in_flight, calls_total, errors_total, last_latency_ms }
+-- A reqobj is { req = <jsonrpc>, result, err, done = semaphore }.
 local _servers = {}
-local _supervisor_started = false
 
-local DEFAULT_TIMEOUT_MS   = 5000
-local SUPERVISE_INTERVAL_S = 5     -- how often the supervisor sweeps for dead servers
-
--- Forward declarations — these are referenced by closures defined earlier
--- in the file than their `function` bodies. Without the `local` here, the
--- earlier references would compile to *global* lookups (always nil) and the
--- respawn path would crash with "attempt to call a nil value".
-local respawn_if_due
-local bring_up
-local supervise
+local DEFAULT_TIMEOUT_MS = 5000
+-- How long the manager blocks waiting for work before an idle tick (during
+-- which it proactively (re)spawns a dead server).
+local IDLE_TICK_S = 5
 
 -- Exponential backoff on respawn — the exponent is clamped at 8, so the
 -- effective ceiling is 2^8 * 100 = 25600ms; the outer min(30000, …) never
--- binds. Keeps a permanently broken server from hammering the host while
--- still retrying eventually.
+-- binds. Keeps a permanently broken server from hammering the host.
 local function backoff_ms(attempts)
     return math.min(30000, (2 ^ math.min(attempts, 8)) * 100)
 end
 
--- Probe an MCP server's subprocess. Returns true if it's believed running
--- and usable, false if it has died or was never spawned.
---
--- We deliberately do NOT use proc:pid() for liveness: ngx.pipe's pid() is a
--- static getter that returns the spawn-time pid forever — it does not become
--- nil when the child exits. Death is instead surfaced as a write/read error
--- on the pipe (or stderr EOF), at which point the call path / stderr drainer
--- flips entry.alive = false. This flag is the source of truth.
+-- A server is usable if we hold a proc and haven't marked it dead. We do NOT
+-- poll proc:pid() for liveness — ngx.pipe's pid() is a static getter that
+-- returns the spawn-time pid forever. Death is surfaced by a write/read error
+-- on the pipe or a stderr EOF, which flips entry.alive = false.
 local function is_alive(entry)
     if not entry or not entry.proc then return false end
     return entry.alive ~= false
 end
 
--- Continuously drain a server's stderr so its pipe buffer can never fill.
--- A stdio MCP server that logs to stderr (the Python SDK does) would
--- otherwise block in write() once the ~64KB kernel buffer fills and stop
--- servicing stdin — a silent, unrecoverable wedge. We run this in a timer
--- (cosocket phase) and log each line. stderr EOF ("closed") is also our
--- cleanest death signal, so we flip entry.alive there.
+-- Drain a server's stderr in its own light-thread so the child can't wedge on a
+-- full stderr buffer, and so we detect death (stderr EOF) even between calls.
+-- Does not own the proc (the manager does), so this thread ending never reaps
+-- the child.
 local function start_stderr_drainer(server_name, proc)
     local ok, terr = ngx.timer.at(0, function(premature)
         if premature then return end
         while true do
             if ngx.worker and ngx.worker.exiting and ngx.worker.exiting() then return end
             local cur = _servers[server_name]
-            -- If the server was respawned, `proc` is stale — this drainer
-            -- belongs to the old process and should exit; the new process
-            -- has its own drainer.
-            if not cur or cur.proc ~= proc then return end
+            if not cur or cur.proc ~= proc then return end  -- superseded by a respawn
 
             local line, rerr = proc:stderr_read_line()
             if line then
                 ngx.log(ngx.INFO, "mcp[", server_name, "] stderr: ", line)
             elseif rerr == "timeout" then
-                -- No output within the read timeout — loop and re-check
-                -- worker/respawn state.
+                -- nothing within the read timeout; loop and re-check state
             else
-                -- "closed" / EOF / other error: the child's stderr is gone,
-                -- which means the process is gone. Mark dead and stop.
                 cur.alive = false
                 ngx.log(ngx.WARN, "mcp[", server_name,
                     "] stderr closed (", tostring(rerr), ") — marking dead")
@@ -127,16 +116,15 @@ end
 local function write_message(proc, msg)
     local body = jsonrpc.encode(msg)
     if not body then return false, "encode failed" end
-    -- ngx.pipe's proc method is `write` (see lualib/ngx/pipe.lua); there is no
-    -- `stdin_write`, and calling it FFI-errors "struct has no member".
-    local ok, err = proc:write({body, "\n"})
+    -- ngx.pipe's proc method is `write` (lualib/ngx/pipe.lua); the array form
+    -- avoids a concat. There is no `stdin_write`.
+    local ok, err = proc:write({ body, "\n" })
     if not ok then return false, err end
     return true
 end
 
--- Round-trip a request: write, then read replies until we see one with
--- the matching id. (MCP servers can interleave server-initiated
--- notifications which we discard for v0.1.)
+-- Round-trip a request: write, then read replies until the id matches.
+-- Interleaved server notifications are discarded for v0.1.
 local function call_and_wait(proc, request)
     local ok, werr = write_message(proc, request)
     if not ok then return nil, "write: " .. tostring(werr) end
@@ -151,12 +139,11 @@ local function call_and_wait(proc, request)
             end
             return msg.result
         end
-        -- Otherwise it's an unrelated notification or out-of-order
-        -- response — ignore for v0.1. Real MCP clients buffer these.
     end
 end
 
--- Build the tool manifest the dispatcher will register.
+-- Build the tool manifest the dispatcher registers. The run closure does NOT
+-- touch the pipe — it hands the call to the server's manager and awaits it.
 local function make_tool_manifest(server, mcp_tool, prefix)
     local local_name = prefix and (prefix .. "." .. mcp_tool.name) or mcp_tool.name
 
@@ -172,99 +159,44 @@ local function make_tool_manifest(server, mcp_tool, prefix)
         run = function(input, _ctx)
             local entry = _servers[server.name]
             if not entry then
-                return { is_error = true, content = "mcp server not running: " .. server.name }
+                return { is_error = true, content = "mcp server not configured: " .. server.name }
             end
 
-            -- Detect dead proc and attempt respawn. If the respawn
-            -- succeeds, the tool name we hold may have been re-registered
-            -- against a fresh manifest — that's fine, our closure still
-            -- finds the new entry on the next lookup.
-            if not is_alive(entry) then
-                local ok, rerr = respawn_if_due(server.name)
-                if not ok then
-                    entry.calls_total  = (entry.calls_total  or 0) + 1
-                    entry.errors_total = (entry.errors_total or 0) + 1
-                    return {
-                        is_error = true,
-                        content  = "mcp_server_dead: " .. server.name .. " — " .. tostring(rerr),
-                    }
-                end
-                entry = _servers[server.name]
-            end
+            local reqobj = {
+                req  = jsonrpc.request("tools/call", {
+                    name = mcp_tool.name, arguments = input or {},
+                }),
+                done = semaphore.new(0),
+            }
 
-            local req = jsonrpc.request("tools/call", {
-                name      = mcp_tool.name,
-                arguments = input or {},
-            })
-
-            -- Serialise pipe access: only one in-flight request per server,
-            -- so concurrent tool calls can't interleave on the shared stdio
-            -- pipe or steal each other's responses. Wait up to the tool's
-            -- timeout for the lock.
-            local timeout_s = (server.timeout_ms or DEFAULT_TIMEOUT_MS) / 1000
-            local lock_ok, lock_err = entry.sem:wait(timeout_s)
-            if not lock_ok then
-                return {
-                    is_error = true,
-                    content  = "mcp_busy: " .. server.name .. " — " .. tostring(lock_err),
-                }
-            end
-
-            -- Re-fetch entry under the lock: the server may have been
-            -- respawned while we were waiting, giving us a fresh proc.
-            -- Also re-check liveness — if it died while we waited but no
-            -- respawn has run yet, fail fast rather than burning the timeout.
-            entry = _servers[server.name] or entry
-            if not is_alive(entry) then
-                entry.sem:post()
-                return {
-                    is_error = true,
-                    content  = "mcp_server_dead: " .. server.name
-                               .. " (died while waiting for lock)",
-                }
-            end
-
-            -- Wrap in pcall so sem:post() is guaranteed even if call_and_wait
-            -- raises an unexpected Lua error (nil-deref, library throw, etc.).
             entry.in_flight = (entry.in_flight or 0) + 1
-            local started_ms = ngx.now() * 1000
-            local call_ok, result, call_err = pcall(call_and_wait, entry.proc, req)
-            entry.sem:post()
+            entry.queue[#entry.queue + 1] = reqobj
+            entry.work:post()
 
-            entry.in_flight     = math.max(0, (entry.in_flight or 1) - 1)
-            entry.last_latency_ms = ngx.now() * 1000 - started_ms
-            entry.calls_total   = (entry.calls_total or 0) + 1
+            -- Wait a hair longer than the per-call timeout so the manager's own
+            -- pipe timeout fires first and gives us a specific error.
+            local wait_s = ((server.timeout_ms or DEFAULT_TIMEOUT_MS) / 1000) + 1
+            local ok = reqobj.done:wait(wait_s)
+            entry.in_flight = math.max(0, (entry.in_flight or 1) - 1)
 
-            if not call_ok then
-                -- result holds the error string thrown by the Lua runtime
-                entry.alive = false
-                entry.errors_total = (entry.errors_total or 0) + 1
-                return { is_error = true, content = "mcp_call_crashed: " .. tostring(result) }
-            elseif not result then
-                -- Only pipe-level failures mean the server is gone.
-                -- JSON-RPC protocol errors (bad params, unknown method, etc.)
-                -- are valid responses from a healthy server and must NOT
-                -- trigger a respawn — only "write:" / "read:" prefixes do.
-                if call_err and (call_err:sub(1, 6) == "write:" or call_err:sub(1, 5) == "read:") then
-                    entry.alive = false
-                end
-                entry.errors_total = (entry.errors_total or 0) + 1
-                return { is_error = true, content = "mcp_call_failed: " .. tostring(call_err) }
+            if not ok then
+                return { is_error = true, content = "mcp_timeout: " .. server.name }
+            end
+            if reqobj.err then
+                return { is_error = true, content = "mcp_call_failed: " .. tostring(reqobj.err) }
+            end
+            local result = reqobj.result
+            if type(result) ~= "table" then
+                return { is_error = true, content = "mcp_no_result: " .. server.name }
             end
 
-            -- MCP returns { content = [{type="text", text="..."}], isError = bool }.
-            -- Project to our { content = string, is_error? = true } shape.
+            -- MCP { content=[{type="text",text=...}], isError } → our shape.
             local pieces = {}
             for _, blk in ipairs(result.content or {}) do
                 if blk.type == "text" and blk.text then
                     pieces[#pieces + 1] = blk.text
                 end
             end
-
-            if result.isError then
-                entry.errors_total = (entry.errors_total or 0) + 1
-            end
-
             return {
                 content  = table.concat(pieces, "\n"),
                 is_error = result.isError and true or nil,
@@ -273,8 +205,11 @@ local function make_tool_manifest(server, mcp_tool, prefix)
     }
 end
 
--- Spawn one server, run initialize handshake + tools/list, register tools.
-function bring_up(server)
+-- Spawn one server, run the initialize + tools/list handshake, register tools.
+-- MUST be called from the server's manager light-thread so the proc it spawns
+-- lives for the worker's lifetime. Mutates the pre-seeded entry (preserving its
+-- queue / work semaphore / counters) rather than replacing it.
+local function bring_up(server)
     local ngx_pipe = require("ngx.pipe")
     local cmd = { server.command }
     for _, a in ipairs(server.args or {}) do cmd[#cmd + 1] = a end
@@ -287,57 +222,30 @@ function bring_up(server)
         server.timeout_ms or DEFAULT_TIMEOUT_MS
     )
 
-    -- 1. initialize
-    local init_req = jsonrpc.request("initialize", {
+    local init_res, ierr = call_and_wait(proc, jsonrpc.request("initialize", {
         protocolVersion = "2024-11-05",
         capabilities    = {},
         clientInfo      = { name = "agent_mux", version = "0.3.0-dev" },
-    })
-    local init_res, ierr = call_and_wait(proc, init_req)
+    }))
     if not init_res then
         proc:shutdown("stdin")
         return nil, "initialize: " .. tostring(ierr)
     end
 
-    -- 2. notifications/initialized (no response expected)
     write_message(proc, jsonrpc.notification("notifications/initialized"))
 
-    -- 3. tools/list
-    local list_req = jsonrpc.request("tools/list")
-    local list_res, lerr = call_and_wait(proc, list_req)
+    local list_res, lerr = call_and_wait(proc, jsonrpc.request("tools/list"))
     if not list_res then
         proc:shutdown("stdin")
         return nil, "tools/list: " .. tostring(lerr)
     end
 
-    -- Preserve counters across respawns so backoff escalates and status
-    -- totals survive a crash; reset attempts on the first successful
-    -- registration after respawn (in respawn_if_due).
-    -- The semaphore (1 resource) is the per-server pipe lock: it serialises
-    -- concurrent tools/call round-trips so two light threads can't interleave
-    -- writes/reads on the same stdio pipe. Preserved across respawns so a
-    -- waiter blocked during a respawn still holds a valid lock afterward.
-    local existing = _servers[server.name]
-    _servers[server.name] = {
-        proc            = proc,
-        info            = init_res,
-        spec            = server,
-        attempts        = (existing and existing.attempts) or 0,
-        last_attempt_ms = ngx.now() * 1000,
-        alive           = true,
-        sem             = (existing and existing.sem) or semaphore.new(1),
-        restarts        = (existing and existing.restarts) or 0,
-        tools           = {},
-        in_flight       = 0,
-        calls_total     = (existing and existing.calls_total) or 0,
-        errors_total    = (existing and existing.errors_total) or 0,
-        last_latency_ms = existing and existing.last_latency_ms,
-    }
+    local entry = _servers[server.name]
+    entry.proc  = proc
+    entry.info  = init_res
+    entry.spec  = server
+    entry.alive = true
 
-    -- Start draining stderr so the child can't deadlock on a full pipe.
-    start_stderr_drainer(server.name, proc)
-
-    -- 4. register every discovered tool
     local registered = {}
     for _, mcp_tool in ipairs(list_res.tools or {}) do
         local manifest = make_tool_manifest(server, mcp_tool, server.tool_prefix)
@@ -348,94 +256,150 @@ function bring_up(server)
             ngx.log(ngx.WARN, "mcp register failed for ", manifest.name, ": ", rerr)
         end
     end
-    _servers[server.name].tools = registered
+    entry.tools = registered
 
+    start_stderr_drainer(server.name, proc)
     return registered
 end
 
--- Try to respawn a dead MCP server. Honours backoff so a perpetually
--- broken process doesn't get hammered. Returns true on success.
-function respawn_if_due(server_name)
-    local entry = _servers[server_name]
-    if not entry then return false, "no spec for " .. server_name end
-    if not entry.spec then return false, "no spec for " .. server_name end
+-- (Re)spawn a dead server if its backoff window has elapsed. Returns true when
+-- the server is up afterwards. Called only from the manager light-thread.
+local function ensure_up(entry)
     if is_alive(entry) then return true end
 
-    local now_ms      = ngx.now() * 1000
-    local since_last  = now_ms - (entry.last_attempt_ms or 0)
-    local needed_wait = backoff_ms(entry.attempts or 0)
-    if since_last < needed_wait then
-        return false, ("backoff: %dms remaining"):format(needed_wait - since_last)
-    end
+    local name    = entry.spec and entry.spec.name or "?"
+    local now_ms  = ngx.now() * 1000
+    local since   = now_ms - (entry.last_attempt_ms or 0)
+    local wait_ms = backoff_ms(entry.attempts or 0)
+    if since < wait_ms then return false end
 
     entry.attempts = (entry.attempts or 0) + 1
     entry.last_attempt_ms = now_ms
-    ngx.log(ngx.WARN, "mcp_server_died: respawning ", server_name,
-                      " (attempt ", entry.attempts, ")")
 
-    -- Kill the stale process before spawning a new one to prevent leaks.
-    -- The proc may still be running if it was wedged/unresponsive rather
-    -- than self-terminated; pcall guards against a kill() error on an
-    -- already-dead handle.
     if entry.proc then
-        pcall(entry.proc.kill, entry.proc, 9)
+        pcall(entry.proc.kill, entry.proc, 9)  -- reap a wedged predecessor
         entry.proc = nil
     end
 
+    local was_up = entry.ever_up
+    ngx.log(ngx.WARN, "mcp: ", was_up and "respawning " or "starting ", name,
+                      " (attempt ", entry.attempts, ")")
     local registered, err = bring_up(entry.spec)
     if not registered then
-        ngx.log(ngx.WARN, "mcp respawn failed for ", server_name, ": ", err)
-        return false, err
+        ngx.log(ngx.WARN, "mcp bring-up failed for ", name, ": ", tostring(err))
+        return false
     end
 
-    -- Success — bump the cumulative restart counter and reset attempts so
-    -- the next failure starts at full backoff window again rather than
-    -- pinning at the cap.
-    local live = _servers[server_name]
-    if live then
-        live.attempts = 0
-        live.restarts = (live.restarts or 0) + 1
-    end
-    ngx.log(ngx.INFO, "mcp_server_respawned: ", server_name,
-                      " (", #registered, " tools re-registered)")
+    entry.attempts = 0
+    entry.ever_up  = true
+    if was_up then entry.restarts = (entry.restarts or 0) + 1 end
+    ngx.log(ngx.INFO, "mcp: ", name, " up (", #registered, " tools)")
     return true
 end
 
--- Background sweep: respawn any server whose subprocess has died. Runs on a
--- timer so recovery does not depend on a tool call arriving; the stderr
--- drainer flips entry.alive on EOF, and this picks it up within one interval.
--- Backoff is enforced inside respawn_if_due, so a broken server is retried at
--- most once per its current backoff window.
-function supervise()
-    for name, entry in pairs(_servers) do
-        if entry.spec and not is_alive(entry) then
-            respawn_if_due(name)
+-- Service exactly one queued request. Returns true if it dequeued one. Kept
+-- separate from the manager loop so unit tests can drive it synchronously.
+local function service_one(entry)
+    local reqobj = table.remove(entry.queue, 1)
+    if not reqobj then return false end
+
+    if not is_alive(entry) then ensure_up(entry) end
+    if not is_alive(entry) then
+        reqobj.err = "server down"
+        reqobj.done:post()
+        return true
+    end
+
+    local t0 = ngx.now() * 1000
+    local ok, result, err = pcall(call_and_wait, entry.proc, reqobj.req)
+    entry.last_latency_ms = ngx.now() * 1000 - t0
+    entry.calls_total = (entry.calls_total or 0) + 1
+
+    if not ok then
+        entry.alive = false
+        entry.errors_total = (entry.errors_total or 0) + 1
+        reqobj.err = "crashed: " .. tostring(result)
+    elseif not result then
+        -- Only pipe-level failures (write:/read:) mean the server is gone;
+        -- JSON-RPC protocol errors are valid replies from a healthy server.
+        if err and (err:sub(1, 6) == "write:" or err:sub(1, 5) == "read:") then
+            entry.alive = false
+        end
+        entry.errors_total = (entry.errors_total or 0) + 1
+        reqobj.err = err
+    else
+        if result.isError then entry.errors_total = (entry.errors_total or 0) + 1 end
+        reqobj.result = result
+    end
+    reqobj.done:post()
+    return true
+end
+
+-- The persistent owner. Spawns + holds the subprocess and services its queue
+-- for the worker's lifetime. Never returns until the worker is exiting, which
+-- is exactly what keeps the child from being reaped.
+local function manager_loop(premature, name)
+    if premature then return end
+    local entry = _servers[name]
+    if not entry then return end
+
+    ensure_up(entry)  -- initial spawn
+    while true do
+        if ngx.worker and ngx.worker.exiting and ngx.worker.exiting() then return end
+        local got = entry.work:wait(IDLE_TICK_S)
+        if got then
+            local sok, serr = pcall(service_one, entry)
+            if not sok then ngx.log(ngx.ERR, "mcp manager ", name, " service error: ", serr) end
+        elseif not is_alive(entry) then
+            ensure_up(entry)  -- idle-tick proactive recovery
         end
     end
 end
 
--- Arm the supervisor timer once per worker. load_manifest runs in a timer
--- phase (see init.lua bootstrap_mcp), where ngx.timer.every is available; if
--- timers are unavailable (unit tests) we no-op and rely on lazy respawn.
-local function start_supervisor()
-    if _supervisor_started then return end
-    if not (ngx and ngx.timer and ngx.timer.every) then return end
-    local ok, err = ngx.timer.every(SUPERVISE_INTERVAL_S, function(premature)
-        if premature then return end
-        local sok, serr = pcall(supervise)
-        if not sok then ngx.log(ngx.WARN, "mcp supervise sweep failed: ", serr) end
-    end)
-    if ok then
-        _supervisor_started = true
-        ngx.log(ngx.INFO, "mcp supervisor armed (every ", SUPERVISE_INTERVAL_S, "s)")
-    else
-        ngx.log(ngx.WARN, "mcp supervisor timer failed to start: ", err)
+-- Start a server's manager once. In unit tests (no ngx.timer) this no-ops and
+-- tests drive bring_up / service_one directly.
+local function start_manager(name)
+    local entry = _servers[name]
+    if not entry or entry.manager_started then return end
+    if not (ngx and ngx.timer and ngx.timer.at) then return end
+    entry.manager_started = true
+    local ok, err = ngx.timer.at(0, manager_loop, name)
+    if not ok then
+        entry.manager_started = false
+        ngx.log(ngx.WARN, "mcp: could not start manager for ", name, ": ", err)
     end
 end
 
--- Read and validate the config file, then bring up every server and arm the
--- supervisor. Called from registry.bootstrap_mcp inside an ngx.timer (init.lua),
--- where ngx.pipe cosocket I/O and ngx.timer.every are both permitted.
+-- Seed an entry (queue + work semaphore + counters) for a server spec.
+local function seed_entry(server)
+    local e = _servers[server.name]
+    if e then
+        e.spec = server
+        e.queue = e.queue or {}
+        e.work  = e.work or semaphore.new(0)
+        return e
+    end
+    _servers[server.name] = {
+        spec            = server,
+        alive           = false,
+        ever_up         = false,
+        attempts        = 0,
+        last_attempt_ms = 0,
+        restarts        = 0,
+        queue           = {},
+        work            = semaphore.new(0),
+        manager_started = false,
+        tools           = {},
+        in_flight       = 0,
+        calls_total     = 0,
+        errors_total    = 0,
+    }
+    return _servers[server.name]
+end
+
+-- Read the manifest, seed each server, and start its manager. Called from
+-- registry.bootstrap_mcp inside an ngx.timer (init.lua). Bring-up itself is
+-- done by each manager, so this returns before tools are registered.
 function _M.load_manifest(path)
     local f, ferr = io.open(path, "rb")
     if not f then return nil, "read " .. path .. ": " .. tostring(ferr) end
@@ -449,47 +413,21 @@ function _M.load_manifest(path)
         return nil, "manifest missing 'servers' array"
     end
 
-    local all_registered = {}
+    local names = {}
     for _, server in ipairs(servers) do
         if not server.name or not server.command then
             ngx.log(ngx.WARN, "mcp server entry missing name/command — skipped")
         else
-            -- Pre-seed a dead stub so the supervisor has a spec to retry even
-            -- if bring_up fails on the first attempt. bring_up replaces this
-            -- entry on success; on failure it remains with alive=false.
-            if not _servers[server.name] then
-                _servers[server.name] = {
-                    spec            = server,
-                    alive           = false,
-                    attempts        = 0,
-                    last_attempt_ms = 0,
-                    sem             = semaphore.new(1),
-                    restarts        = 0,
-                    tools           = {},
-                    in_flight       = 0,
-                    calls_total     = 0,
-                    errors_total    = 0,
-                }
-            else
-                _servers[server.name].spec = server
-            end
-            local registered, err = bring_up(server)
-            if not registered then
-                ngx.log(ngx.WARN, "mcp server '", server.name, "' bring-up failed: ", err)
-            else
-                for _, n in ipairs(registered) do
-                    all_registered[#all_registered + 1] = n
-                end
-            end
+            seed_entry(server)
+            start_manager(server.name)
+            names[#names + 1] = server.name
         end
     end
-
-    start_supervisor()
-    return all_registered
+    return names
 end
 
--- Point-in-time status of every supervised server. Consumed by the
--- GET /v1/mcp/servers endpoint and the CLI status view.
+-- Point-in-time status of every supervised server. Consumed by
+-- GET /v1/mcp/servers and the CLI status view.
 function _M.status()
     local out = {}
     for name, e in pairs(_servers) do
@@ -522,14 +460,15 @@ _M._servers            = function() return _servers end
 _M._backoff_ms         = backoff_ms
 _M._is_alive           = is_alive
 _M._make_tool_manifest = make_tool_manifest
-_M._supervise          = function() return supervise() end
+_M._seed_entry         = seed_entry
+_M._bring_up           = bring_up
+_M._service_one        = service_one
 
 function _M._reset_for_test()
     for _, e in pairs(_servers) do
         if e.proc then pcall(function() e.proc:shutdown("stdin") end) end
     end
     _servers = {}
-    _supervisor_started = false
 end
 
 return _M
