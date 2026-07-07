@@ -148,6 +148,24 @@ without keys, and the demo MCP server is supervised out of the box. Drop a
 `.env` (copy `.env.example`) to set API keys, your own MCP manifest, or ports.
 On Linux, point a systemd unit at `scripts/agentmux.sh foreground`.
 
+## Dashboard
+
+A localhost-only web UI, served by the same OpenResty process on a dedicated
+port — no extra service to run. Start agent_mux (`make up`) and open it:
+
+```bash
+make dashboard        # opens http://localhost:7100
+```
+
+Auto-refreshing every 3s, it shows:
+- health + redis status and the worker pid
+- the **MCP fleet** table — up/down, restarts, in-flight, calls, errors, last latency
+- **tool-call counts** by tool and outcome (parsed from `/metrics`)
+- a filterable, searchable tail of the **error log**, warnings/errors highlighted
+
+It binds `127.0.0.1:7100` only, so it isn't exposed on the network. Endpoints:
+`/api/health`, `/api/status`, `/api/logs`, `/api/metrics`.
+
 ## HTTP surface
 
 | Route                          | Purpose                                                    |
