@@ -9,7 +9,7 @@
 -- Endpoints (all same-origin, so the page needs no CORS):
 --   GET /            → the dashboard page
 --   GET /api/health  → { ok, worker_pid, redis_up }
---   GET /api/status  → server.mcp_status() (MCP fleet)
+--   GET /api/status  → MCP fleet (unauthenticated; port is localhost-only)
 --   GET /api/logs    → tail of logs/error.log (text)
 --   GET /api/metrics → Prometheus exposition (reused)
 
@@ -17,8 +17,10 @@ local cjson = require("cjson.safe")
 
 local _M = {}
 
-local LOG_PATH      = "logs/error.log"
-local LOG_TAIL_BYTES = 256 * 1024   -- only read the last chunk of the log
+-- Absolute path derived from nginx prefix so this works regardless of CWD.
+local LOG_PATH      = ngx.config.prefix() .. "logs/error.log"
+-- Capped to avoid blocking the event loop on every 3-second poll.
+local LOG_TAIL_BYTES = 16 * 1024
 
 -- GET /api/health
 function _M.health()
@@ -40,10 +42,18 @@ function _M.health()
     }))
 end
 
+-- GET /api/status  (no auth — port 7100 is 127.0.0.1-only)
+function _M.status()
+    local mcp     = require("agent_mux.tools.mcp")
+    local servers = mcp.status()
+    ngx.header["Content-Type"] = "application/json"
+    ngx.say(cjson.encode({ servers = servers, count = #servers }))
+end
+
 -- Drop nginx connection-churn noise that drowns out the useful lines.
 local function is_noise(line)
     return line:find("closed keepalive connection", 1, true) ~= nil
-        or line:find("kevent%(%) reported") ~= nil
+        or line:find("kevent() reported", 1, true) ~= nil
         or line:find("SSL_", 1, true) ~= nil
 end
 
@@ -54,7 +64,7 @@ local function want_line(line, level)
                 or line:find("%[alert%]") or line:find("%[emerg%]")
     if level == "error" then return is_err ~= nil end
     if level == "warn"  then return (is_err or line:find("%[warn%]")) ~= nil end
-    return true
+    return false  -- unknown level: show nothing rather than everything
 end
 
 -- GET /api/logs?n=300&level=all|warn|error
@@ -279,8 +289,10 @@ async function refresh(){
     setHealth(true, health.redis_up, health.worker_pid);
     renderFleet(status.servers || []);
     try { renderTools(await tget('/api/metrics')); } catch(e){}
-    logText = await tget('/api/logs?n=400&level=' + level);
-    renderLog();
+    try {
+      logText = await tget('/api/logs?n=400&level=' + level);
+      renderLog();
+    } catch(e){ $('#log').textContent = 'Failed to load logs: ' + e.message; }
     $('#updated').textContent = new Date().toLocaleTimeString();
   } catch(e){
     setHealth(false, false, '—');
