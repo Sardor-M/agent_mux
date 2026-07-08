@@ -180,6 +180,7 @@ local function make_tool_manifest(server, mcp_tool, prefix)
             entry.in_flight = math.max(0, (entry.in_flight or 1) - 1)
 
             if not ok then
+                reqobj.cancelled = true
                 return { is_error = true, content = "mcp_timeout: " .. server.name }
             end
             if reqobj.err then
@@ -302,6 +303,7 @@ end
 local function service_one(entry)
     local reqobj = table.remove(entry.queue, 1)
     if not reqobj then return false end
+    if reqobj.cancelled then return true end
 
     if not is_alive(entry) then ensure_up(entry) end
     if not is_alive(entry) then
@@ -328,7 +330,7 @@ local function service_one(entry)
         entry.errors_total = (entry.errors_total or 0) + 1
         reqobj.err = err
     else
-        if result.isError then entry.errors_total = (entry.errors_total or 0) + 1 end
+        if type(result) == "table" and result.isError then entry.errors_total = (entry.errors_total or 0) + 1 end
         reqobj.result = result
     end
     reqobj.done:post()

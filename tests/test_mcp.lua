@@ -119,6 +119,25 @@ describe("tools.mcp", function()
         assert.is_nil(reqobj.result)
     end)
 
+    it("service_one skips a cancelled request without calling the server", function()
+        mcp._seed_entry({ name = "t", command = "fake" })
+        mcp._bring_up({ name = "t", command = "fake" })
+        local e = mcp._servers()["t"]
+
+        local reqobj = {
+            req       = jsonrpc.request("tools/call", { name = "echo", arguments = {} }),
+            done      = sema.new(0),
+            cancelled = true,
+        }
+        e.queue[#e.queue + 1] = reqobj
+
+        local serviced = mcp._service_one(e)
+        assert.is_true(serviced)
+        assert.is_nil(reqobj.err)
+        assert.is_nil(reqobj.result)
+        assert.equals(0, e.calls_total)
+    end)
+
     it("load_manifest seeds servers (with queue) and returns their names", function()
         local tmp = os.tmpname()
         local fh = io.open(tmp, "w")
