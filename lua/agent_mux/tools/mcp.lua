@@ -341,8 +341,11 @@ end
 -- for the worker's lifetime. Never returns until the worker is exiting, which
 -- is exactly what keeps the child from being reaped.
 local function manager_loop(premature, name)
-    if premature then return end
     local entry = _servers[name]
+    if premature then
+        if entry then entry.manager_started = false end
+        return
+    end
     if not entry then return end
 
     ensure_up(entry)  -- initial spawn
