@@ -71,7 +71,8 @@ end
 function _M.logs()
     local args  = ngx.req.get_uri_args()
     local n     = math.min(tonumber(args.n) or 300, 2000)
-    local level = args.level or "all"
+    local raw   = args.level
+    local level = (raw == "warn" or raw == "error" or raw == "all") and raw or "all"
 
     ngx.header["Content-Type"] = "text/plain; charset=utf-8"
 
