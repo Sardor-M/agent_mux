@@ -312,6 +312,11 @@ local function service_one(entry)
         return true
     end
 
+    -- Re-check: ensure_up yields on pipe I/O, so the caller's timeout may have
+    -- fired between the first cancelled check and here. Avoid sending an
+    -- abandoned request to the subprocess.
+    if reqobj.cancelled then return true end
+
     local t0 = ngx.now() * 1000
     local ok, result, err = pcall(call_and_wait, entry.proc, reqobj.req)
     entry.last_latency_ms = ngx.now() * 1000 - t0
