@@ -5,7 +5,7 @@ REDIS      := redis-server
 
 .DEFAULT_GOAL := help
 
-.PHONY: help check-deps dev stop demo test fmt clean dirs status watch \
+.PHONY: help check-deps dev stop demo test fmt clean dirs status watch dashboard \
         up down restart logs service-install service-uninstall
 
 help:                  ## Show available targets
@@ -56,6 +56,9 @@ status:                ## Show supervised MCP server status (one-shot table)
 
 watch:                 ## Live-refreshing MCP server status (Ctrl+C to exit)
 	@bash scripts/agent-mux-status.sh --watch
+
+dashboard:             ## Open the web ops dashboard (http://localhost:7100)
+	@open http://localhost:7100 2>/dev/null || echo "open http://localhost:7100 in your browser"
 
 fmt:                   ## Format Lua sources with stylua if available
 	@command -v stylua >/dev/null && stylua lua/ tests/ examples/ || echo "stylua not installed — skipping"
